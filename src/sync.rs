@@ -23,12 +23,55 @@ enum ReceiverToSender {
     Error(String),
 }
 
-pub enum HandlerState {
-    Init,
-    RequestSnapshot,
-    Compare(Vec<PathEntry>),
-    SendPatch(Vec<SnapshotEntry>),
-    Finish,
+#[derive(Clone)]
+pub enum SendEvent {
+    Started,
+    SnapshotReceived {
+        entry_count: usize,
+    },
+    DiffComputed {
+        total_entries: usize,
+        total_bytes: u64,
+    },
+    EntryStarted {
+        index: usize,
+        path: PathBuf,
+    },
+    Progress {
+        bytes: usize,
+    },
+    EntryFinished {
+        index: usize,
+    },
+    Finished,
+    Error(String),
+}
+
+#[derive(Clone)]
+pub enum RecvEvent {
+    Started,
+    SnapshotSent { entry_count: usize },
+    EntryReceiving { path: PathBuf },
+    Progress { bytes: usize },
+    EntryApplied { path: PathBuf },
+    Finished,
+    Error(String),
+}
+
+pub trait FromProgress {
+    fn from_bytes(n: usize) -> Self;
+}
+
+impl FromProgress for SendEvent {
+    fn from_bytes(n: usize) -> Self {
+        SendEvent::Progress { bytes: n }
+    }
+}
+
+impl FromProgress for RecvEvent {
+    fn from_bytes(n: usize) -> Self {
+        RecvEvent::Progress { bytes: n }
+    }
 }
 
 pub struct Handler {
@@ -41,11 +84,13 @@ impl Handler {
         Ok(Self { conn, root })
     }
 
-    pub async fn send_loop(&mut self) -> eyre::Result<()> {
+    pub async fn send_loop(&mut self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
         let (ev_send, ev_recv) = self.conn.open_bi().await?;
 
         let mut ev_handler =
-            EventStreamHandler::<SenderToReceiver, ReceiverToSender>::new(ev_send, ev_recv);
+            EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
+                ev_send, ev_recv, tx,
+            );
 
         ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
 
@@ -71,10 +116,13 @@ impl Handler {
         Ok(())
     }
 
-    pub async fn recv_loop(&mut self) -> eyre::Result<()> {
+    pub async fn recv_loop(&mut self, tx: flume::Sender<RecvEvent>) -> eyre::Result<()> {
         let (ev_send, ev_recv) = self.conn.accept_bi().await?;
+
         let mut ev_handler =
-            EventStreamHandler::<ReceiverToSender, SenderToReceiver>::new(ev_send, ev_recv);
+            EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
+                ev_send, ev_recv, tx,
+            );
 
         loop {
             match ev_handler.recv().await? {
@@ -97,41 +145,48 @@ impl Handler {
     }
 }
 
-struct EventStreamHandler<T, R> {
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+struct EventStreamHandler<T, R, P> {
+    send: TrackedStream<iroh::endpoint::SendStream, P>,
+    recv: TrackedStream<iroh::endpoint::RecvStream, P>,
 
     _t: std::marker::PhantomData<T>,
     _r: std::marker::PhantomData<R>,
 }
 
-impl<T, R> EventStreamHandler<T, R>
+impl<T, R, P> EventStreamHandler<T, R, P>
 where
     T: Serialize,
     R: DeserializeOwned,
+    P: FromProgress + Clone,
 {
-    pub fn new(send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream) -> Self {
+    pub fn new(
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        tracker_tx: flume::Sender<P>,
+    ) -> Self {
         Self {
-            send,
-            recv,
+            send: TrackedStream::new(send, tracker_tx.clone()),
+            recv: TrackedStream::new(recv, tracker_tx),
             _t: std::marker::PhantomData,
             _r: std::marker::PhantomData,
         }
     }
 
     pub async fn send(&mut self, msg: T) -> eyre::Result<()> {
-        Ok(send_msg(&mut self.send, &msg).await?)
+        send_msg(&mut self.send, &msg).await
     }
 
     pub async fn recv(&mut self) -> eyre::Result<R> {
-        Ok(recv_msg(&mut self.recv).await?)
+        recv_msg(&mut self.recv).await
     }
 }
 
-async fn send_msg<T: Serialize>(
-    stream: &mut iroh::endpoint::SendStream,
-    msg: &T,
-) -> eyre::Result<()> {
+async fn send_msg<T, R, P>(stream: &mut TrackedStream<R, P>, msg: &T) -> eyre::Result<()>
+where
+    T: Serialize,
+    R: tokio::io::AsyncWrite + Unpin,
+    P: FromProgress + Clone,
+{
     let payload = postcard::to_stdvec(msg)?;
     let len = payload.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;
@@ -139,12 +194,77 @@ async fn send_msg<T: Serialize>(
     Ok(())
 }
 
-async fn recv_msg<T: DeserializeOwned>(stream: &mut iroh::endpoint::RecvStream) -> eyre::Result<T> {
+async fn recv_msg<T, R, P>(stream: &mut TrackedStream<R, P>) -> eyre::Result<T>
+where
+    T: DeserializeOwned,
+    R: tokio::io::AsyncRead + Unpin,
+    P: FromProgress + Clone,
+{
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
+    stream.read_exact_tracked(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
+    stream.read_exact_tracked(&mut payload).await?;
     Ok(postcard::from_bytes(&payload)?)
+}
+
+pub struct TrackedStream<S, E> {
+    inner: S,
+    tx: flume::Sender<E>,
+}
+
+impl<S, E> TrackedStream<S, E> {
+    pub fn new(inner: S, tx: flume::Sender<E>) -> Self {
+        Self { inner, tx }
+    }
+}
+
+impl<S, E> TrackedStream<S, E>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+    E: FromProgress,
+{
+    pub async fn write_all(&mut self, data: &[u8]) -> eyre::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut sent = 0;
+        while sent < data.len() {
+            let n = self.inner.write(&data[sent..]).await?;
+
+            if n == 0 {
+                eyre::bail!("stream closed before all bytes were written");
+            }
+            sent += n;
+
+            // Swallow the error (probably log it too?)
+            let _ = self.tx.send_async(E::from_bytes(n)).await;
+        }
+
+        Ok(())
+    }
+}
+
+impl<S, E> TrackedStream<S, E>
+where
+    S: tokio::io::AsyncRead + Unpin,
+    E: FromProgress,
+{
+    pub async fn read_exact_tracked(&mut self, buf: &mut [u8]) -> eyre::Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut received = 0;
+        while received < buf.len() {
+            let n = self.inner.read(&mut buf[received..]).await?;
+            if n == 0 {
+                eyre::bail!("stream closed before all bytes were received");
+            }
+            received += n;
+
+            // Swallow the error (probably log it too?)
+            let _ = self.tx.send_async(E::from_bytes(n)).await;
+        }
+
+        Ok(())
+    }
 }
