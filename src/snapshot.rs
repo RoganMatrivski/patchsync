@@ -6,9 +6,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::dirwalker::PathEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PathKey(String);
 
 impl<'p> From<&'p Path> for PathKey {
@@ -40,8 +42,13 @@ impl PathKey {
         let rel = full.strip_prefix(root).unwrap();
         rel.into()
     }
+
+    pub fn from_pathentry(root: impl AsRef<Path>, entry: &PathEntry) -> eyre::Result<Self> {
+        Ok(entry.into_path_root_trimmed(root.as_ref())?.into())
+    }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SnapshotEntry {
     Create { path: PathBuf, bytes: Vec<u8> },
     Delete { path: PathBuf },
