@@ -75,21 +75,24 @@ impl FromProgress for RecvEvent {
 }
 
 pub struct Handler {
-    conn: Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
     root: PathBuf,
 }
 
 impl Handler {
-    pub async fn new(conn: Connection, root: PathBuf) -> eyre::Result<Self> {
-        Ok(Self { conn, root })
+    pub async fn new(
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        root: PathBuf,
+    ) -> eyre::Result<Self> {
+        Ok(Self { send, recv, root })
     }
 
-    pub async fn send_loop(&mut self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
-        let (ev_send, ev_recv) = self.conn.open_bi().await?;
-
+    pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
         let mut ev_handler =
             EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
-                ev_send, ev_recv, tx,
+                self.send, self.recv, tx,
             );
 
         ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
@@ -116,12 +119,10 @@ impl Handler {
         Ok(())
     }
 
-    pub async fn recv_loop(&mut self, tx: flume::Sender<RecvEvent>) -> eyre::Result<()> {
-        let (ev_send, ev_recv) = self.conn.accept_bi().await?;
-
+    pub async fn recv_loop(self, tx: flume::Sender<RecvEvent>) -> eyre::Result<()> {
         let mut ev_handler =
             EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
-                ev_send, ev_recv, tx,
+                self.send, self.recv, tx,
             );
 
         loop {
