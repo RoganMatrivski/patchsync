@@ -135,7 +135,7 @@ where
         match (old.get(key), new_entry) {
             // New file
             (None, PathEntry::File { path, .. }) => entries.push(SnapshotEntry::Create {
-                path: path.clone(),
+                path: PathBuf::from(&key.0),
                 bytes: std::fs::read(path)?,
             }),
             (None, PathEntry::Dir { path: _ }) => {
@@ -159,7 +159,7 @@ where
                     qbsdiff::Bsdiff::new(&oldbin, &newbin).compare(&mut patch)?;
 
                     entries.push(SnapshotEntry::Update {
-                        path: new_path.clone(),
+                        path: PathBuf::from(&key.0),
                         patch,
                     });
                 }
@@ -172,12 +172,12 @@ where
             //              comparing enum type regardless of data within
             (Some(old_e), new_e) if mem::discriminant(old_e) != mem::discriminant(new_e) => {
                 entries.push(SnapshotEntry::Delete {
-                    path: old_e.into_path(),
+                    path: PathBuf::from(&key.0),
                 });
 
                 match new_e {
                     PathEntry::File { path, .. } => entries.push(SnapshotEntry::Create {
-                        path: path.clone(),
+                        path: PathBuf::from(&key.0),
                         bytes: std::fs::read(path)?,
                     }),
                     PathEntry::Dir { .. } => {
@@ -191,10 +191,10 @@ where
 
     // Reverse of before
     // Essentially DELETE entries
-    for (key, old_entry) in &old {
+    for (key, _old_entry) in &old {
         if !new.contains_key(key) {
             entries.push(SnapshotEntry::Delete {
-                path: old_entry.into_path(),
+                path: PathBuf::from(&key.0),
             });
         }
     }
