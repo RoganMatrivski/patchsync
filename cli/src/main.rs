@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use color_eyre::Report;
 use iroh::endpoint::presets;
-use patchsync::{ALPN, RecvProtocol};
+use patchsync::RecvProtocol;
 mod init;
 
 // Avoid musl's default allocator due to lackluster performance
@@ -14,45 +14,77 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tracing::instrument]
 #[tokio::main]
 async fn main() -> Result<(), Report> {
-    init::initialize()?;
+    let args = init::initialize()?;
     println!("Hello, world!");
 
-    let base = std::path::PathBuf::from_str("C:/delete_after/test_dirtree/")?;
-    let old_root = base.join("old_tree");
-    let new_root = base.join("new_tree");
+    let root = args.root_dir;
 
-    let old_ep = iroh::Endpoint::builder(presets::N0).bind().await?;
-    let new_ep = iroh::Endpoint::builder(presets::N0).bind().await?;
+    match args.command {
+        init::Command::Send { ticket } => handle_send(root, ticket).await?,
+        init::Command::Receive => handle_recv(root).await?,
+    }
 
-    let (send_evtx, send_evrx) = flume::unbounded();
-    let (recv_evtx, recv_evrx) = flume::unbounded();
+    Ok(())
+}
 
-    // Receiver node: uses Router to automatically accept incoming connections and handle stream
-    let recv_protocol = RecvProtocol::new(new_root, recv_evtx);
-    let router = iroh::protocol::Router::builder(new_ep.clone())
-        .accept(ALPN, recv_protocol)
+async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
+    let ep = iroh::Endpoint::builder(presets::N0).bind().await?;
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(ep.addr());
+    println!("TICKET: {ticket}");
+    let (tx, rx) = flume::unbounded();
+    let proto = RecvProtocol::new(root, tx);
+    let router = iroh::protocol::Router::builder(ep)
+        .accept(patchsync::ALPN, proto)
         .spawn();
 
-    let _send_evloop = tokio::spawn(async move {
-        for x in send_evrx {
-            println!("SEND: {x:?}")
-        }
-    });
-
     let _recv_evloop = tokio::spawn(async move {
-        for x in recv_evrx {
-            println!("RECV: {x:?}")
+        for e in rx {
+            // no-op
         }
     });
 
-    // Sender node: connects to receiver and initiates sync stream
-    let send_conn = old_ep.connect(new_ep.addr(), ALPN).await?;
-    let (send_tx, send_rx) = send_conn.open_bi().await?;
-    let send_handler = patchsync::SendHandler::new(send_tx, send_rx, old_root).await?;
-
-    send_handler.send_loop(send_evtx).await?;
+    tokio::signal::ctrl_c().await?;
 
     router.shutdown().await?;
+
+    Ok(())
+}
+
+async fn handle_send(
+    root: std::path::PathBuf,
+    ticket: iroh_tickets::endpoint::EndpointTicket,
+) -> eyre::Result<()> {
+    let ep = iroh::Endpoint::builder(presets::N0).bind().await?;
+    let (evtx, evrx) = flume::unbounded();
+    let conn = ep.connect(ticket, patchsync::ALPN).await?;
+
+    let (tx, rx) = conn.open_bi().await?;
+    let handler = patchsync::SendHandler::new(tx, rx, root).await?;
+
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let _send_evloop = tokio::spawn(async move {
+        for x in evrx {
+            match x {
+                patchsync::sync::SendEvent::DiffComputed { total_bytes, .. } => {
+                    pb.disable_steady_tick();
+                    pb.set_style(indicatif::ProgressStyle::default_bar());
+                    pb.set_length(total_bytes);
+                    pb.tick();
+                }
+                patchsync::sync::SendEvent::Progress { bytes } => {
+                    pb.inc(bytes as u64);
+                }
+                patchsync::sync::SendEvent::Finished => {
+                    pb.finish();
+                }
+                ev => pb.println(format!("SEND: {ev:?}")),
+            }
+        }
+    });
+
+    handler.send_loop(evtx).await?;
 
     Ok(())
 }

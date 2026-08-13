@@ -7,6 +7,19 @@ pub struct Args {
     /// Verbosity log
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    #[command(subcommand)]
+    pub command: Command,
+
+    pub root_dir: std::path::PathBuf,
+}
+
+#[derive(clap::Subcommand)]
+pub enum Command {
+    Send {
+        ticket: iroh_tickets::endpoint::EndpointTicket,
+    },
+    Receive,
 }
 
 const VERBOSE_LEVELS: &[&str] = &["info", "debug", "trace"];
@@ -19,7 +32,7 @@ macro_rules! pkg_name {
 pub fn initialize() -> Result<Args, Report> {
     use tracing_error::ErrorLayer;
     use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
 
     color_eyre::install()?;
 
