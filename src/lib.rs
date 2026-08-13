@@ -30,6 +30,8 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
     ) -> Result<(), iroh::protocol::AcceptError> {
         let (send, recv) = connection.accept_bi().await?;
 
+        let _ = self.tx.send_async(RecvEvent::Started).await;
+
         let mut ev_handler =
             EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
                 send,
@@ -47,18 +49,34 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         .collect::<Result<HashMap<_, _>, eyre::Error>>()
                         .unwrap();
 
+                    let entry_count = old.len();
                     ev_handler
                         .send(ReceiverToSender::Snapshot(old))
                         .await
                         .unwrap();
+
+                    let _ = self
+                        .tx
+                        .send_async(RecvEvent::SnapshotSent { entry_count })
+                        .await;
                 }
                 SenderToReceiver::SendPatch(items) => {
                     for i in items {
+                        let path = i.path().to_path_buf();
+                        let _ = self
+                            .tx
+                            .send_async(RecvEvent::EntryReceiving { path: path.clone() })
+                            .await;
+
                         i.apply(&self.root).unwrap();
+
+                        let _ = self.tx.send_async(RecvEvent::EntryApplied { path }).await;
                     }
 
                     ev_handler.send(ReceiverToSender::Ack).await.unwrap();
                     ev_handler.finish().await.unwrap();
+
+                    let _ = self.tx.send_async(RecvEvent::Finished).await;
 
                     // Wait for sender to read Ack and close stream
                     let _ = ev_handler.recv().await;
@@ -66,6 +84,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 }
                 SenderToReceiver::Ack => {
                     ev_handler.finish().await.unwrap();
+                    let _ = self.tx.send_async(RecvEvent::Finished).await;
                     break;
                 }
             }
@@ -91,9 +110,13 @@ impl SendHandler {
     }
 
     pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
+        let _ = tx.send_async(SendEvent::Started).await;
+
         let mut ev_handler =
             EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
-                self.send, self.recv, tx,
+                self.send,
+                self.recv,
+                tx.clone(),
             );
 
         ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
@@ -101,6 +124,12 @@ impl SendHandler {
         loop {
             match ev_handler.recv().await? {
                 ReceiverToSender::Snapshot(old) => {
+                    let _ = tx
+                        .send_async(SendEvent::SnapshotReceived {
+                            entry_count: old.len(),
+                        })
+                        .await;
+
                     let new_snapshot = crate::dirwalker::walkdir(&self.root)?;
                     let new = new_snapshot
                         .into_iter()
@@ -108,15 +137,34 @@ impl SendHandler {
                         .collect::<Result<HashMap<_, _>, eyre::Error>>()?;
                     let diff = crate::snapshot::diff(old, new)?;
 
-                    // Will need devise a way to track patch send progress
-                    // But for now, this'll do
+                    let total_entries = diff.len();
+                    let total_bytes = diff
+                        .iter()
+                        .map(|item| match item {
+                            snapshot::SnapshotEntry::Create { bytes, .. } => bytes.len() as u64,
+                            snapshot::SnapshotEntry::Update { patch, .. } => patch.len() as u64,
+                            snapshot::SnapshotEntry::Delete { .. } => 0,
+                        })
+                        .sum();
+
+                    let _ = tx
+                        .send_async(SendEvent::DiffComputed {
+                            total_entries,
+                            total_bytes,
+                        })
+                        .await;
+
                     ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
                 }
                 ReceiverToSender::Ack => {
                     ev_handler.finish().await?;
+                    let _ = tx.send_async(SendEvent::Finished).await;
                     break;
                 }
-                ReceiverToSender::Error(_) => todo!(),
+                ReceiverToSender::Error(err) => {
+                    let _ = tx.send_async(SendEvent::Error(err.clone())).await;
+                    eyre::bail!("Receiver error: {err}");
+                }
             }
         }
 

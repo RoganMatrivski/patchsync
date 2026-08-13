@@ -77,6 +77,14 @@ impl fmt::Debug for SnapshotEntry {
 }
 
 impl SnapshotEntry {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Create { path, .. } => path,
+            Self::Delete { path } => path,
+            Self::Update { path, .. } => path,
+        }
+    }
+
     pub fn apply(self, root: impl AsRef<Path>) -> eyre::Result<()> {
         if !root.as_ref().exists() {
             eyre::bail!(
