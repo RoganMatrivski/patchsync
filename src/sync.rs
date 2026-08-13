@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -8,19 +8,20 @@ use crate::{
 };
 
 #[derive(Serialize, Deserialize)]
-enum SenderToReceiver {
+pub enum SenderToReceiver {
     RequestSnapshot,
     SendPatch(Vec<SnapshotEntry>),
+    Ack,
 }
 
 #[derive(Serialize, Deserialize)]
-enum ReceiverToSender {
+pub enum ReceiverToSender {
     Snapshot(std::collections::HashMap<PathKey, PathEntry>),
     Ack,
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum SendEvent {
     Started,
     SnapshotReceived {
@@ -44,7 +45,7 @@ pub enum SendEvent {
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum RecvEvent {
     Started,
     SnapshotSent { entry_count: usize },
@@ -71,84 +72,7 @@ impl FromProgress for RecvEvent {
     }
 }
 
-pub struct Handler {
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
-    root: PathBuf,
-}
-
-impl Handler {
-    pub async fn new(
-        send: iroh::endpoint::SendStream,
-        recv: iroh::endpoint::RecvStream,
-        root: PathBuf,
-    ) -> eyre::Result<Self> {
-        Ok(Self { send, recv, root })
-    }
-
-    pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
-        let mut ev_handler =
-            EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
-                self.send, self.recv, tx,
-            );
-
-        ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
-
-        loop {
-            match ev_handler.recv().await? {
-                ReceiverToSender::Snapshot(old) => {
-                    let new_snapshot = crate::dirwalker::walkdir(&self.root)?;
-                    let new = new_snapshot
-                        .into_iter()
-                        .map(|x| eyre::Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
-                        .collect::<Result<HashMap<_, _>, eyre::Error>>()?;
-                    let diff = crate::snapshot::diff(old, new)?;
-
-                    // Will need devise a way to track patch send progress
-                    // But for now, this'll do
-                    ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
-                }
-                ReceiverToSender::Ack => break,
-                ReceiverToSender::Error(_) => todo!(),
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn recv_loop(self, tx: flume::Sender<RecvEvent>) -> eyre::Result<()> {
-        let mut ev_handler =
-            EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
-                self.send, self.recv, tx,
-            );
-
-        loop {
-            match ev_handler.recv().await? {
-                SenderToReceiver::RequestSnapshot => {
-                    let old_snapshot = crate::dirwalker::walkdir(&self.root)?;
-                    let old = old_snapshot
-                        .into_iter()
-                        .map(|x| eyre::Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
-                        .collect::<Result<HashMap<_, _>, eyre::Error>>()?;
-
-                    ev_handler.send(ReceiverToSender::Snapshot(old)).await?;
-                }
-                SenderToReceiver::SendPatch(items) => {
-                    for i in items {
-                        i.apply(&self.root)?;
-                    }
-
-                    // Do we exit on patch sent or we keep looping?
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-struct EventStreamHandler<T, R, P> {
+pub struct EventStreamHandler<T, R, P> {
     send: TrackedStream<iroh::endpoint::SendStream, P>,
     recv: TrackedStream<iroh::endpoint::RecvStream, P>,
 

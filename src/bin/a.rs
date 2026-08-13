@@ -1,6 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::str::FromStr;
 
 use iroh::endpoint::presets;
+use patchsync::{ALPN, RecvProtocol};
 
 #[tokio::main]
 pub async fn main() -> eyre::Result<()> {
@@ -11,21 +12,35 @@ pub async fn main() -> eyre::Result<()> {
     let old_ep = iroh::Endpoint::builder(presets::N0).bind().await?;
     let new_ep = iroh::Endpoint::builder(presets::N0).bind().await?;
 
-    let send_conn = old_ep.connect(new_ep.addr(), patchsync::ALPN).await?;
-    let recv_conn = new_ep.connect(old_ep.addr(), patchsync::ALPN).await?;
-
-    let (send_tx, send_rx) = send_conn.open_bi().await?;
-    let send_handler = patchsync::sync::Handler::new(send_tx, send_rx, old_root).await?;
-    let (recv_tx, recv_rx) = recv_conn.accept_bi().await?;
-    let recv_handler = patchsync::sync::Handler::new(recv_tx, recv_rx, new_root).await?;
-
     let (send_evtx, send_evrx) = flume::unbounded();
     let (recv_evtx, recv_evrx) = flume::unbounded();
 
-    tokio::try_join!(
-        send_handler.send_loop(send_evtx),
-        recv_handler.recv_loop(recv_evtx)
-    )?;
+    // Receiver node: uses Router to automatically accept incoming connections and handle stream
+    let recv_protocol = RecvProtocol::new(new_root, recv_evtx);
+    let router = iroh::protocol::Router::builder(new_ep.clone())
+        .accept(ALPN, recv_protocol)
+        .spawn();
+
+    let _send_evloop = tokio::spawn(async move {
+        for x in send_evrx {
+            dbg!(x);
+        }
+    });
+
+    let _recv_evloop = tokio::spawn(async move {
+        for x in recv_evrx {
+            dbg!(x);
+        }
+    });
+
+    // Sender node: connects to receiver and initiates sync stream
+    let send_conn = old_ep.connect(new_ep.addr(), ALPN).await?;
+    let (send_tx, send_rx) = send_conn.open_bi().await?;
+    let send_handler = patchsync::SendHandler::new(send_tx, send_rx, old_root).await?;
+
+    send_handler.send_loop(send_evtx).await?;
+
+    router.shutdown().await?;
 
     Ok(())
 }

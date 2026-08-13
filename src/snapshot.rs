@@ -37,6 +37,7 @@ impl From<PathBuf> for PathKey {
     }
 }
 
+#[allow(dead_code)]
 impl PathKey {
     fn from_paths(root: &Path, full: &Path) -> Self {
         let rel = full.strip_prefix(root).unwrap();
@@ -129,7 +130,7 @@ where
                 path: path.clone(),
                 bytes: std::fs::read(path)?,
             }),
-            (None, PathEntry::Dir { path }) => {
+            (None, PathEntry::Dir { path: _ }) => {
                 // No-op, probably will add new dir if needed
             }
 
