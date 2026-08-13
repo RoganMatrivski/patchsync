@@ -96,6 +96,9 @@ impl SnapshotEntry {
         match self {
             SnapshotEntry::Create { path, bytes } => {
                 let p = root.as_ref().join(path);
+                if let Some(pdir) = p.parent() {
+                    std::fs::create_dir_all(&pdir)?;
+                }
                 std::fs::write(p, bytes)?;
             }
             SnapshotEntry::Update { path, patch } => {
