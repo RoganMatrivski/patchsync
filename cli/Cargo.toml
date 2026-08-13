@@ -1,0 +1,17 @@
+[package]
+name = "patchsync-cli"
+version = "0.1.0"
+authors = ["Robin Mauritz <robin@mdev.co.id>"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
+[dependencies]
+clap.workspace = true
+color-eyre.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tracing-error.workspace = true
+tracing-subscriber.workspace = true
