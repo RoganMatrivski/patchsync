@@ -9,9 +9,14 @@ edition = "2024"
 mimalloc.workspace = true
 
 [dependencies]
+patchsync.workspace = true
+
 clap.workspace = true
 color-eyre.workspace = true
 eyre.workspace = true
+iroh.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tracing.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
+flume.workspace = true
