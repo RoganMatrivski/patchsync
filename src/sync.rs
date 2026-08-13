@@ -106,6 +106,17 @@ where
     pub async fn recv(&mut self) -> eyre::Result<R> {
         recv_msg(&mut self.recv).await
     }
+
+    pub async fn finish(&mut self) -> eyre::Result<()> {
+        self.send.finish().await
+    }
+}
+
+impl<E> TrackedStream<iroh::endpoint::SendStream, E> {
+    pub async fn finish(&mut self) -> eyre::Result<()> {
+        self.inner.finish()?;
+        Ok(())
+    }
 }
 
 async fn send_msg<T, R, P>(stream: &mut TrackedStream<R, P>, msg: &T) -> eyre::Result<()>

@@ -23,13 +23,13 @@ pub async fn main() -> eyre::Result<()> {
 
     let _send_evloop = tokio::spawn(async move {
         for x in send_evrx {
-            dbg!(x);
+            println!("SEND: {x:?}")
         }
     });
 
     let _recv_evloop = tokio::spawn(async move {
         for x in recv_evrx {
-            dbg!(x);
+            println!("RECV: {x:?}")
         }
     });
 

@@ -58,9 +58,16 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     }
 
                     ev_handler.send(ReceiverToSender::Ack).await.unwrap();
+                    ev_handler.finish().await.unwrap();
+
+                    // Wait for sender to read Ack and close stream
+                    let _ = ev_handler.recv().await;
                     break;
                 }
-                SenderToReceiver::Ack => break,
+                SenderToReceiver::Ack => {
+                    ev_handler.finish().await.unwrap();
+                    break;
+                }
             }
         }
 
@@ -105,7 +112,10 @@ impl SendHandler {
                     // But for now, this'll do
                     ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
                 }
-                ReceiverToSender::Ack => break,
+                ReceiverToSender::Ack => {
+                    ev_handler.finish().await?;
+                    break;
+                }
                 ReceiverToSender::Error(_) => todo!(),
             }
         }
