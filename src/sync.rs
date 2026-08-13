@@ -127,6 +127,7 @@ where
 {
     let payload = postcard::to_stdvec(msg)?;
     let len = payload.len() as u32;
+    tracing::trace!(len = len, "Sending message over stream");
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&payload).await?;
     Ok(())
@@ -142,6 +143,7 @@ where
     stream.read_exact_tracked(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
+    tracing::trace!(len = len, "Receiving message payload");
     let mut payload = vec![0u8; len];
     stream.read_exact_tracked(&mut payload).await?;
     Ok(postcard::from_bytes(&payload)?)
@@ -171,12 +173,15 @@ where
             let n = self.inner.write(&data[sent..]).await?;
 
             if n == 0 {
+                tracing::error!("Stream closed unexpectedly before all bytes were written");
                 eyre::bail!("stream closed before all bytes were written");
             }
             sent += n;
+            tracing::trace!(bytes = n, "Stream wrote bytes");
 
-            // Swallow the error (probably log it too?)
-            let _ = self.tx.send_async(E::from_bytes(n)).await;
+            if let Err(e) = self.tx.send_async(E::from_bytes(n)).await {
+                tracing::warn!("Failed to send progress event to channel: {e}");
+            }
         }
 
         Ok(())
@@ -195,12 +200,15 @@ where
         while received < buf.len() {
             let n = self.inner.read(&mut buf[received..]).await?;
             if n == 0 {
+                tracing::debug!("Stream closed during read (EOF or peer shutdown)");
                 eyre::bail!("stream closed before all bytes were received");
             }
             received += n;
+            tracing::trace!(bytes = n, "Stream read bytes");
 
-            // Swallow the error (probably log it too?)
-            let _ = self.tx.send_async(E::from_bytes(n)).await;
+            if let Err(e) = self.tx.send_async(E::from_bytes(n)).await {
+                tracing::warn!("Failed to send progress event to channel: {e}");
+            }
         }
 
         Ok(())
