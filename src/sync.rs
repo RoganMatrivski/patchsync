@@ -1,14 +1,11 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     dirwalker::PathEntry,
     snapshot::{PathKey, SnapshotEntry},
 };
-
-const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/0/";
 
 #[derive(Serialize, Deserialize)]
 enum SenderToReceiver {
@@ -137,7 +134,12 @@ impl Handler {
                     ev_handler.send(ReceiverToSender::Snapshot(old)).await?;
                 }
                 SenderToReceiver::SendPatch(items) => {
-                    todo!() // TODO: Handle things here
+                    for i in items {
+                        i.apply(&self.root)?;
+                    }
+
+                    // Do we exit on patch sent or we keep looping?
+                    break;
                 }
             }
         }
