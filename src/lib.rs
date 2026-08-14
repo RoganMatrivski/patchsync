@@ -236,8 +236,8 @@ impl SendHandler {
                         .iter()
                         .map(|item| match item {
                             snapshot::SnapshotEntry::Create { bytes, .. } => bytes.len() as u64,
-                            snapshot::SnapshotEntry::Update { patches, .. } => {
-                                patches.iter().map(|x| x.length).sum::<u64>()
+                            snapshot::SnapshotEntry::Update { instructs, .. } => {
+                                instructs.iter().map(|x| x.get_length()).sum::<u64>()
                             }
                             snapshot::SnapshotEntry::Delete { .. } => 0,
                         })

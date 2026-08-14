@@ -55,6 +55,17 @@ pub enum PatchInstructs {
     Literal { data: Vec<u8> },
 }
 
+impl PatchInstructs {
+    pub fn get_length(&self) -> u64 {
+        match self {
+            PatchInstructs::Copy { .. } => {
+                0 // What's even the length of this over the wire
+            }
+            PatchInstructs::Literal { data } => data.len() as u64,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum SnapshotEntry {
     Create {
