@@ -101,7 +101,7 @@ async fn handle_send(
                     pb.inc(bytes as u64);
                 }
                 patchsync::sync::SendEvent::Finished => {
-                    pb.finish();
+                    pb.finish_and_clear();
                 }
                 ev => pb.println(format!("SEND: {ev:?}")),
             }
