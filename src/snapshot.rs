@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use postcard::fixint::le;
 use serde::{Deserialize, Serialize};
 
 use crate::dirwalker::PathEntry;
