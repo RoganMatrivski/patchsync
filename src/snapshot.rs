@@ -50,17 +50,24 @@ impl PathKey {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct Patch {
-    pub offset: u64,
-    pub length: u64, // Not strictly needed, but a nice to have
-    pub data: Vec<u8>,
+pub enum PatchInstructs {
+    Copy { offset: u64, length: u64 },
+    Literal { data: Vec<u8> },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum SnapshotEntry {
-    Create { path: PathBuf, bytes: Vec<u8> },
-    Delete { path: PathBuf },
-    Update { path: PathBuf, patches: Vec<Patch> },
+    Create {
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Update {
+        path: PathBuf,
+        instructs: Vec<PatchInstructs>,
+    },
 }
 
 impl fmt::Debug for SnapshotEntry {
@@ -74,10 +81,10 @@ impl fmt::Debug for SnapshotEntry {
 
             Self::Delete { path } => f.debug_struct("Delete").field("path", path).finish(),
 
-            Self::Update { path, patches } => f
+            Self::Update { path, instructs } => f
                 .debug_struct("Update")
                 .field("path", path)
-                .field("patches_len", &patches.len())
+                .field("instructs_len", &instructs.len())
                 .finish(),
         }
     }
@@ -108,21 +115,25 @@ impl SnapshotEntry {
                 }
                 std::fs::write(p, bytes)?;
             }
-            SnapshotEntry::Update { path, patches } => {
+            SnapshotEntry::Update { path, instructs } => {
                 let p = root.as_ref().join(path);
-                let mut filebin = std::fs::read(&p)?;
+                let filebin = std::fs::read(&p)?;
+                let mut newfilebin = vec![];
 
-                for Patch {
-                    data,
-                    length,
-                    offset,
-                } in patches
-                {
-                    let (len, o) = (length as usize, offset as usize);
-                    filebin.splice(o..(o + len), data);
+                for entry in instructs {
+                    match entry {
+                        PatchInstructs::Copy { offset, length } => {
+                            let uoffset = offset as usize;
+                            let ulength = length as usize;
+                            newfilebin.extend_from_slice(&filebin[uoffset..uoffset + ulength]);
+                        }
+                        PatchInstructs::Literal { data } => {
+                            newfilebin.extend(data);
+                        }
+                    }
                 }
 
-                std::fs::write(p, filebin)?;
+                std::fs::write(p, newfilebin)?;
             }
             SnapshotEntry::Delete { path } => {
                 let p = root.as_ref().join(path);
@@ -173,7 +184,7 @@ where
                     .collect::<HashMap<_, _>>();
 
                 let new_filebin = std::fs::read(new_path)?;
-                let mut patches = vec![];
+                let mut instructs = vec![];
 
                 for crate::chunker::FileChunk {
                     hash,
@@ -182,14 +193,16 @@ where
                 } in new_chunks
                 {
                     match old_chunkmap.get(&hash) {
-                        Some(_) => {
+                        Some(old) => {
                             tracing::trace!(offset, length, "Chunk matched with old");
+                            instructs.push(PatchInstructs::Copy {
+                                offset: old.offset,
+                                length: old.length,
+                            });
                         }
                         None => {
                             tracing::debug!("Chunk not found. Creating patches");
-                            patches.push(Patch {
-                                length: *length,
-                                offset: *offset,
+                            instructs.push(PatchInstructs::Literal {
                                 data: new_filebin
                                     [(*offset as usize)..(*offset as usize + *length as usize)]
                                     .to_vec(),
@@ -200,7 +213,7 @@ where
 
                 entries.push(SnapshotEntry::Update {
                     path: PathBuf::from(&key.0),
-                    patches,
+                    instructs,
                 });
             }
 
