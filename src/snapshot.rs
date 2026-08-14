@@ -136,6 +136,16 @@ impl SnapshotEntry {
                         PatchInstructs::Copy { offset, length } => {
                             let uoffset = offset as usize;
                             let ulength = length as usize;
+
+                            if uoffset + ulength > filebin.len() {
+                                eyre::bail!(
+                                    "Copy instruction bounds error: file len {}, requested range {}..{}",
+                                    filebin.len(),
+                                    uoffset,
+                                    uoffset + ulength
+                                );
+                            }
+
                             newfilebin.extend_from_slice(&filebin[uoffset..uoffset + ulength]);
                         }
                         PatchInstructs::Literal { data } => {
@@ -213,10 +223,12 @@ where
                         }
                         None => {
                             tracing::debug!("Chunk not found. Creating patches");
+                            let uoffset = *offset as usize;
+                            let ulength = *length as usize;
+                            let start = uoffset.min(new_filebin.len());
+                            let end = (uoffset + ulength).min(new_filebin.len());
                             instructs.push(PatchInstructs::Literal {
-                                data: new_filebin
-                                    [(*offset as usize)..(*offset as usize + *length as usize)]
-                                    .to_vec(),
+                                data: new_filebin[start..end].to_vec(),
                             })
                         }
                     }
