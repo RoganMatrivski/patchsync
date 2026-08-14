@@ -155,6 +155,8 @@ where
                     hash: new_hash,
                 },
             ) => {
+                // TODO: MASSIVE REWRITE
+                // Why did i naively think i can just compare with old file lmao
                 if old_hash != new_hash {
                     let mut patch = Vec::new();
                     let oldbin = std::fs::read(&old_path)?;
