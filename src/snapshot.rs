@@ -173,7 +173,7 @@ where
                     .map(crate::chunker::FileChunk::to_hashmap_kv)
                     .collect::<HashMap<_, _>>();
 
-                let new_filebin = std::fs::read(PathBuf::from(&key.0))?;
+                let new_filebin = std::fs::read(new_path)?;
                 let mut patches = vec![];
 
                 for crate::chunker::FileChunk {
