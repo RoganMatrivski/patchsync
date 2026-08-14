@@ -26,6 +26,7 @@ async fn main() -> Result<(), Report> {
 }
 
 async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
+    // TODO: Set key to project data dir
     let key_path = root.join(".patchsync_key");
     let key = if key_path.exists() {
         let key_bytes = tokio::fs::read(&key_path).await?;
@@ -37,7 +38,10 @@ async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
     } else {
         let key = iroh::SecretKey::generate();
         if let Err(e) = tokio::fs::write(&key_path, key.to_bytes()).await {
-            tracing::warn!("Failed to persist secret key to {}: {e}", key_path.display());
+            tracing::warn!(
+                "Failed to persist secret key to {}: {e}",
+                key_path.display()
+            );
         }
         key
     };
