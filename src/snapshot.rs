@@ -191,7 +191,9 @@ where
                             patches.push(Patch {
                                 length: *length,
                                 offset: *offset,
-                                data: new_filebin[(*length as usize)..(*offset as usize)].to_vec(),
+                                data: new_filebin
+                                    [(*offset as usize)..(*offset as usize + *length as usize)]
+                                    .to_vec(),
                             })
                         }
                     }
