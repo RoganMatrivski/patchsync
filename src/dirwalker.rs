@@ -2,10 +2,17 @@ use std::{fs::File, io::BufReader, path::PathBuf, thread};
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder};
 
+use crate::chunker::FileChunk;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum PathEntry {
-    Dir { path: PathBuf },
-    File { path: PathBuf, hash: [u8; 32] },
+    Dir {
+        path: PathBuf,
+    },
+    File {
+        path: PathBuf,
+        chunks: Vec<FileChunk>,
+    },
 }
 
 impl PathEntry {
@@ -45,17 +52,12 @@ impl ParallelVisitor for FileVisitor {
                         ignore::WalkState::Continue
                     }
                 } else {
-                    let mut hasher = blake3::Hasher::new();
-                    let reader =
-                        BufReader::new(File::open(e.path()).expect("TODO: Failed to open file"));
-                    hasher
-                        .update_reader(reader)
-                        .expect("TODO: Failed to update hasher");
-                    let hash = *hasher.finalize().as_bytes();
+                    // TODO: Replace with memmap2 thingy
+                    let filebin = std::fs::read(e.path()).expect("Failed to read file");
 
                     let fileentry = PathEntry::File {
                         path: e.into_path(),
-                        hash,
+                        chunks: crate::chunker::chunk(&filebin),
                     };
 
                     if let Err(e) = self.tx.send(fileentry) {

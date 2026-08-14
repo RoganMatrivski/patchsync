@@ -5,6 +5,7 @@ use crate::{
     sync::{EventStreamHandler, ReceiverToSender, RecvEvent, SendEvent, SenderToReceiver},
 };
 
+pub mod chunker;
 pub mod dirwalker;
 pub mod snapshot;
 pub mod sync;
@@ -119,8 +120,15 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
 
                         if let Err(e) = item.apply(&self.root) {
-                            let chain = e.chain().map(|c| c.to_string()).collect::<Vec<_>>().join(": ");
-                            let err_msg = format!("Failed to apply patch entry for {}: {chain}", path.display());
+                            let chain = e
+                                .chain()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join(": ");
+                            let err_msg = format!(
+                                "Failed to apply patch entry for {}: {chain}",
+                                path.display()
+                            );
                             tracing::error!("{err_msg}");
                             let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
                             let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
@@ -228,7 +236,9 @@ impl SendHandler {
                         .iter()
                         .map(|item| match item {
                             snapshot::SnapshotEntry::Create { bytes, .. } => bytes.len() as u64,
-                            snapshot::SnapshotEntry::Update { patch, .. } => patch.len() as u64,
+                            snapshot::SnapshotEntry::Update { patches, .. } => {
+                                patches.iter().map(|x| x.length).sum::<u64>()
+                            }
                             snapshot::SnapshotEntry::Delete { .. } => 0,
                         })
                         .sum();

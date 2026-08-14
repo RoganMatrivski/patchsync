@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use postcard::fixint::le;
 use serde::{Deserialize, Serialize};
 
 use crate::dirwalker::PathEntry;
@@ -50,10 +51,17 @@ impl PathKey {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+pub struct Patch {
+    pub offset: u64,
+    pub length: u64, // Not strictly needed, but a nice to have
+    pub data: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SnapshotEntry {
     Create { path: PathBuf, bytes: Vec<u8> },
     Delete { path: PathBuf },
-    Update { path: PathBuf, patch: Vec<u8> },
+    Update { path: PathBuf, patches: Vec<Patch> },
 }
 
 impl fmt::Debug for SnapshotEntry {
@@ -67,10 +75,10 @@ impl fmt::Debug for SnapshotEntry {
 
             Self::Delete { path } => f.debug_struct("Delete").field("path", path).finish(),
 
-            Self::Update { path, patch } => f
+            Self::Update { path, patches } => f
                 .debug_struct("Update")
                 .field("path", path)
-                .field("p_len", &patch.len())
+                .field("patches_len", &patches.len())
                 .finish(),
         }
     }
@@ -101,15 +109,21 @@ impl SnapshotEntry {
                 }
                 std::fs::write(p, bytes)?;
             }
-            SnapshotEntry::Update { path, patch } => {
+            SnapshotEntry::Update { path, patches } => {
                 let p = root.as_ref().join(path);
-                let patcher = qbsdiff::Bspatch::new(&patch)?;
-                let oldbin = std::fs::read(&p)?;
-                let mut newbin = Vec::new();
+                let mut filebin = std::fs::read(&p)?;
 
-                patcher.apply(&oldbin, &mut newbin)?;
+                for Patch {
+                    data,
+                    length,
+                    offset,
+                } in patches
+                {
+                    let (len, o) = (length as usize, offset as usize);
+                    filebin.splice(o..len, data);
+                }
 
-                std::fs::write(p, newbin)?;
+                std::fs::write(p, filebin)?;
             }
             SnapshotEntry::Delete { path } => {
                 let p = root.as_ref().join(path);
@@ -147,27 +161,46 @@ where
 
             (
                 Some(PathEntry::File {
-                    hash: old_hash,
-                    path: old_path,
+                    chunks: old_chunks, ..
                 }),
                 PathEntry::File {
                     path: new_path,
-                    hash: new_hash,
+                    chunks: new_chunks,
                 },
             ) => {
-                // TODO: MASSIVE REWRITE
-                // Why did i naively think i can just compare with old file lmao
-                if old_hash != new_hash {
-                    let mut patch = Vec::new();
-                    let oldbin = std::fs::read(&old_path)?;
-                    let newbin = std::fs::read(&new_path)?;
-                    qbsdiff::Bsdiff::new(&oldbin, &newbin).compare(&mut patch)?;
+                let old_chunkmap = old_chunks
+                    .into_iter()
+                    .map(crate::chunker::FileChunk::to_hashmap_kv)
+                    .collect::<HashMap<_, _>>();
 
-                    entries.push(SnapshotEntry::Update {
-                        path: PathBuf::from(&key.0),
-                        patch,
-                    });
+                let new_filebin = std::fs::read(PathBuf::from(&key.0))?;
+                let mut patches = vec![];
+
+                for crate::chunker::FileChunk {
+                    hash,
+                    length,
+                    offset,
+                } in new_chunks
+                {
+                    match old_chunkmap.get(&hash) {
+                        Some(_) => {
+                            tracing::trace!(offset, length, "Chunk matched with old");
+                        }
+                        None => {
+                            tracing::debug!("Chunk not found. Creating patches");
+                            patches.push(Patch {
+                                length: *length,
+                                offset: *offset,
+                                data: new_filebin[(*length as usize)..(*offset as usize)].to_vec(),
+                            })
+                        }
+                    }
                 }
+
+                entries.push(SnapshotEntry::Update {
+                    path: PathBuf::from(&key.0),
+                    patches,
+                });
             }
 
             // The type changed, dir -> file and vice versa
