@@ -128,7 +128,13 @@ impl SnapshotEntry {
             }
             SnapshotEntry::Update { path, instructs } => {
                 let p = root.as_ref().join(path);
-                let filebin = std::fs::read(&p)?;
+                let file = std::fs::File::open(&p)?;
+
+                // TODO: Add feature flag to disable memmap2
+                // Why tho
+                // SAFETY: File opened for read-only. Shoulda been safe
+                let filebin = unsafe { memmap2::Mmap::map(&file) }?;
+
                 let mut newfilebin = vec![];
 
                 for entry in instructs {

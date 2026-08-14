@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufReader, path::PathBuf, thread};
+use std::{path::PathBuf, thread};
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder};
 
@@ -52,8 +52,12 @@ impl ParallelVisitor for FileVisitor {
                         ignore::WalkState::Continue
                     }
                 } else {
-                    // TODO: Replace with memmap2 thingy
-                    let filebin = std::fs::read(e.path()).expect("Failed to read file");
+                    let file = std::fs::File::open(e.path()).expect("Failed to read file");
+
+                    // TODO: Add feature flag to disable memmap2
+                    // Why tho
+                    // SAFETY: File opened for read-only. Shoulda been safe
+                    let filebin = unsafe { memmap2::Mmap::map(&file) }.expect("Failed to map file");
 
                     let fileentry = PathEntry::File {
                         path: e.into_path(),

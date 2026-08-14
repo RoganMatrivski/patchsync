@@ -36,6 +36,7 @@ fastcdc = "4.0.1"
 flume.workspace = true
 ignore.workspace = true
 iroh.workspace = true
+memmap2 = "0.9.11"
 postcard.workspace = true
 qbsdiff.workspace = true
 serde.workspace = true
