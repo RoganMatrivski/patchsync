@@ -234,6 +234,16 @@ where
                     }
                 }
 
+                if instructs.is_empty()
+                    || instructs
+                        .iter()
+                        .all(|x| matches!(x, PatchInstructs::Copy { .. }))
+                {
+                    break;
+                }
+
+                tracing::debug!(len = instructs.len(), "Instructs not empty!");
+
                 entries.push(SnapshotEntry::Update {
                     path: PathBuf::from(&key.0),
                     instructs,
