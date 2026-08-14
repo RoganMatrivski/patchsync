@@ -239,7 +239,7 @@ where
                     offset,
                 } in new_chunks
                 {
-                    match old_chunkmap.get(&hash) {
+                    match old_chunkmap.get(hash) {
                         Some(old) => {
                             tracing::trace!(offset, length, "Chunk matched with old");
                             instructs.push(PatchInstructs::Copy {
@@ -381,5 +381,3 @@ mod tests {
         Ok(())
     }
 }
-
-
