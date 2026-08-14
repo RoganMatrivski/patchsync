@@ -231,6 +231,26 @@ impl SendHandler {
                         .collect::<Result<HashMap<_, _>, eyre::Error>>()?;
                     let diff = crate::snapshot::diff(old, new)?;
 
+                    if diff.is_empty() {
+                        tracing::info!("No changes detected; notifying receiver and finishing sync");
+                        if let Err(e) = tx
+                            .send_async(SendEvent::DiffComputed {
+                                total_entries: 0,
+                                total_bytes: 0,
+                            })
+                            .await
+                        {
+                            tracing::warn!("Failed to send DiffComputed event: {e}");
+                        }
+
+                        ev_handler.send(SenderToReceiver::Ack).await?;
+                        ev_handler.finish().await?;
+                        if let Err(e) = tx.send_async(SendEvent::Finished).await {
+                            tracing::warn!("Failed to send SendEvent::Finished: {e}");
+                        }
+                        break;
+                    }
+
                     let total_entries = diff.len();
                     let total_bytes = diff
                         .iter()
