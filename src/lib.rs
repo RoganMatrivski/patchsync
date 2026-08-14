@@ -43,23 +43,56 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
             );
 
         loop {
-            match ev_handler.recv().await.unwrap() {
+            let msg = match ev_handler.recv().await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!("Connection closed or failed to receive message: {e}");
+                    let _ = self.tx.send_async(RecvEvent::Error(e.to_string())).await;
+                    break;
+                }
+            };
+
+            match msg {
                 SenderToReceiver::RequestSnapshot => {
                     tracing::trace!("Received RequestSnapshot from sender");
-                    let old_snapshot = crate::dirwalker::walkdir(&self.root).unwrap();
-                    let old = old_snapshot
+                    let old_snapshot = match crate::dirwalker::walkdir(&self.root) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let err_msg = format!("Failed to walk root directory: {e}");
+                            tracing::error!("{err_msg}");
+                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        }
+                    };
+
+                    let old = match old_snapshot
                         .into_iter()
-                        .map(|x| eyre::Ok((PathKey::from_pathentry(&self.root, &x).unwrap(), x)))
+                        .map(|x| {
+                            PathKey::from_pathentry(&self.root, &x)
+                                .map(|k| (k, x))
+                                .map_err(eyre::Error::from)
+                        })
                         .collect::<Result<HashMap<_, _>, eyre::Error>>()
-                        .unwrap();
+                    {
+                        Ok(map) => map,
+                        Err(e) => {
+                            let err_msg = format!("Failed to build snapshot map: {e}");
+                            tracing::error!("{err_msg}");
+                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        }
+                    };
 
                     let entry_count = old.len();
                     tracing::debug!(entry_count, "Generated snapshot, sending to peer");
 
-                    ev_handler
-                        .send(ReceiverToSender::Snapshot(old))
-                        .await
-                        .unwrap();
+                    if let Err(e) = ev_handler.send(ReceiverToSender::Snapshot(old)).await {
+                        tracing::error!("Failed to send snapshot to peer: {e}");
+                        let _ = self.tx.send_async(RecvEvent::Error(e.to_string())).await;
+                        break;
+                    }
 
                     if let Err(e) = self
                         .tx
@@ -72,6 +105,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 SenderToReceiver::SendPatch(items) => {
                     tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
+                    let mut apply_failed = false;
                     for item in items {
                         let path = item.path().to_path_buf();
                         tracing::debug!(path = %path.display(), "Receiving entry patch");
@@ -85,8 +119,13 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
 
                         if let Err(e) = item.apply(&self.root) {
-                            tracing::error!(path = %path.display(), error = %e, "Failed to apply patch entry");
-                            return Err(iroh::protocol::AcceptError::from_boxed(e.into()));
+                            let chain = e.chain().map(|c| c.to_string()).collect::<Vec<_>>().join(": ");
+                            let err_msg = format!("Failed to apply patch entry for {}: {chain}", path.display());
+                            tracing::error!("{err_msg}");
+                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            apply_failed = true;
+                            break;
                         }
 
                         tracing::debug!(path = %path.display(), "Patch entry applied successfully");
@@ -95,9 +134,17 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
                     }
 
+                    if apply_failed {
+                        break;
+                    }
+
                     tracing::info!("All patches applied successfully, sending Ack");
-                    ev_handler.send(ReceiverToSender::Ack).await.unwrap();
-                    ev_handler.finish().await.unwrap();
+                    if let Err(e) = ev_handler.send(ReceiverToSender::Ack).await {
+                        tracing::warn!("Failed to send Ack: {e}");
+                    }
+                    if let Err(e) = ev_handler.finish().await {
+                        tracing::warn!("Failed to finish stream: {e}");
+                    }
 
                     if let Err(e) = self.tx.send_async(RecvEvent::Finished).await {
                         tracing::warn!("Failed to send RecvEvent::Finished: {e}");
@@ -111,7 +158,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 }
                 SenderToReceiver::Ack => {
                     tracing::trace!("Received Ack from peer");
-                    ev_handler.finish().await.unwrap();
+                    let _ = ev_handler.finish().await;
                     if let Err(e) = self.tx.send_async(RecvEvent::Finished).await {
                         tracing::warn!("Failed to send RecvEvent::Finished: {e}");
                     }
