@@ -172,8 +172,19 @@ impl SnapshotEntry {
                 tempfile.persist(p)?;
             }
             SnapshotEntry::Delete { path } => {
+                if path.as_os_str().is_empty() {
+                    return Ok(());
+                }
                 let p = root.as_ref().join(path);
-                std::fs::remove_file(&p)?;
+                if p.is_dir() {
+                    std::fs::remove_dir_all(&p)?;
+                } else {
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
         }
 
@@ -301,3 +312,74 @@ where
 
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_delete_directory_entry() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let sub_dir = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub_dir)?;
+        let file_path = sub_dir.join("test.txt");
+        std::fs::write(&file_path, "hello")?;
+
+        let old_entries = crate::dirwalker::walkdir(dir.path())?;
+        let old_map = old_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let new_map: HashMap<PathKey, PathEntry> = HashMap::new();
+        let diff_entries = diff(old_map, new_map)?;
+
+        // Apply diff on original directory
+        for entry in diff_entries {
+            entry.apply(dir.path())?;
+        }
+
+        assert!(!sub_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_dir_changed_to_file() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let sub_dir = dir.path().join("item");
+        std::fs::create_dir_all(&sub_dir)?;
+
+        let old_entries = crate::dirwalker::walkdir(dir.path())?;
+        let old_map = old_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        // Replace item directory with a file named item
+        std::fs::remove_dir_all(&sub_dir)?;
+        std::fs::write(&sub_dir, "content")?;
+
+        let new_entries = crate::dirwalker::walkdir(dir.path())?;
+        let new_map = new_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let diff_entries = diff(old_map, new_map)?;
+
+        // Re-create the dir structure to test applying patch
+        std::fs::remove_file(&sub_dir)?;
+        std::fs::create_dir_all(&sub_dir)?;
+
+        for entry in diff_entries {
+            entry.apply(dir.path())?;
+        }
+
+        assert!(sub_dir.is_file());
+        assert_eq!(std::fs::read_to_string(&sub_dir)?, "content");
+        Ok(())
+    }
+}
+
+
