@@ -120,7 +120,7 @@ impl SnapshotEntry {
                 } in patches
                 {
                     let (len, o) = (length as usize, offset as usize);
-                    filebin.splice(o..len, data);
+                    filebin.splice(o..(o + len), data);
                 }
 
                 std::fs::write(p, filebin)?;
