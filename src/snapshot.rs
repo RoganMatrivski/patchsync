@@ -265,7 +265,7 @@ where
                         .iter()
                         .all(|x| matches!(x, PatchInstructs::Copy { .. }))
                 {
-                    break;
+                    continue;
                 }
 
                 tracing::debug!(len = instructs.len(), "Instructs not empty!");
@@ -380,4 +380,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sub_dir)?, "content");
         Ok(())
     }
+
+    #[test]
+    fn test_diff_multiple_files_with_unchanged() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.txt");
+        std::fs::write(&file_a, "initial content a")?;
+        std::fs::write(&file_b, "initial content b")?;
+
+        let old_entries = crate::dirwalker::walkdir(dir.path())?;
+        let old_map = old_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        // Modify file_b, keep file_a unchanged
+        std::fs::write(&file_b, "modified content b")?;
+
+        let new_entries = crate::dirwalker::walkdir(dir.path())?;
+        let new_map = new_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let diff_entries = diff(old_map, new_map)?;
+
+        // Must contain an Update for b.txt and no entries for a.txt
+        assert_eq!(diff_entries.len(), 1);
+        assert_eq!(diff_entries[0].path(), Path::new("b.txt"));
+
+        Ok(())
+    }
 }
+
