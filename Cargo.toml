@@ -40,6 +40,7 @@ memmap2 = "0.9.11"
 postcard.workspace = true
 qbsdiff.workspace = true
 serde.workspace = true
+tempfile = "3.27.0"
 tokio.workspace = true
 tracing.workspace = true
 

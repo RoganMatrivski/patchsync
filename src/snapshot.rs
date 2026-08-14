@@ -2,10 +2,12 @@ use std::{
     collections::HashMap,
     fmt,
     hash::Hash,
+    io::Write,
     mem,
     path::{Path, PathBuf},
 };
 
+use eyre::ContextCompat;
 use serde::{Deserialize, Serialize};
 
 use crate::dirwalker::PathEntry;
@@ -130,6 +132,7 @@ impl SnapshotEntry {
                 let p = root.as_ref().join(path);
                 let file = std::fs::File::open(&p)?;
 
+                // TODO: TODO: Replace with seek read.
                 // TODO: Add feature flag to disable memmap2
                 // Why tho
                 // SAFETY: File opened for read-only. Shoulda been safe
@@ -160,7 +163,13 @@ impl SnapshotEntry {
                     }
                 }
 
-                std::fs::write(p, newfilebin)?;
+                drop(filebin);
+
+                let mut tempfile =
+                    tempfile::NamedTempFile::new_in(p.parent().wrap_err("Path is not a file")?)?;
+
+                tempfile.write_all(&newfilebin)?;
+                tempfile.persist(p)?;
             }
             SnapshotEntry::Delete { path } => {
                 let p = root.as_ref().join(path);
