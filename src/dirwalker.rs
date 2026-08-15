@@ -109,3 +109,95 @@ pub fn walkdir(dir: impl Into<PathBuf>) -> eyre::Result<Vec<PathEntry>> {
 
     Ok(rx.into_iter().collect::<Vec<_>>())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_path_entry_methods() -> eyre::Result<()> {
+        let root = PathBuf::from("/tmp/root");
+        let dir_entry = PathEntry::Dir {
+            path: root.join("sub/dir"),
+        };
+        assert_eq!(dir_entry.into_path(), root.join("sub/dir"));
+        assert_eq!(
+            dir_entry.into_path_root_trimmed(&root)?,
+            PathBuf::from("sub/dir")
+        );
+
+        let file_entry = PathEntry::File {
+            path: root.join("sub/file.txt"),
+            chunks: vec![],
+        };
+        assert_eq!(file_entry.into_path(), root.join("sub/file.txt"));
+        assert_eq!(
+            file_entry.into_path_root_trimmed(&root)?,
+            PathBuf::from("sub/file.txt")
+        );
+
+        let invalid_root = PathBuf::from("/other/root");
+        assert!(dir_entry.into_path_root_trimmed(&invalid_root).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_walkdir_empty() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let entries = walkdir(dir.path())?;
+        // walkdir includes the root dir entry itself when ignore walks root
+        assert!(!entries.is_empty());
+        let root_dir_present = entries.iter().any(|e| match e {
+            PathEntry::Dir { path } => path == dir.path(),
+            _ => false,
+        });
+        assert!(root_dir_present);
+        Ok(())
+    }
+
+    #[test]
+    fn test_walkdir_nested_structure() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let sub = dir.path().join("a/b");
+        std::fs::create_dir_all(&sub)?;
+        let file1 = sub.join("f1.txt");
+        let file2 = dir.path().join("f2.txt");
+
+        std::fs::write(&file1, "content1")?;
+        std::fs::write(&file2, "content2")?;
+
+        let entries = walkdir(dir.path())?;
+
+        let mut found_f1 = false;
+        let mut found_f2 = false;
+        let mut found_sub = false;
+
+        for entry in entries {
+            match entry {
+                PathEntry::File { path, chunks } => {
+                    if path == file1 {
+                        found_f1 = true;
+                        assert_eq!(chunks.len(), 1);
+                    } else if path == file2 {
+                        found_f2 = true;
+                        assert_eq!(chunks.len(), 1);
+                    }
+                }
+                PathEntry::Dir { path } => {
+                    if path == sub {
+                        found_sub = true;
+                    }
+                }
+            }
+        }
+
+        assert!(found_f1);
+        assert!(found_f2);
+        assert!(found_sub);
+
+        Ok(())
+    }
+}
+

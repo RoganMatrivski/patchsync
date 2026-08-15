@@ -31,3 +31,55 @@ pub fn chunk(data: &[u8]) -> Vec<FileChunk> {
         })
         .collect::<Vec<_>>()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunk_empty_data() {
+        let chunks = chunk(&[]);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_small_data() {
+        let data = b"hello patchsync world";
+        let chunks = chunk(data);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].offset, 0);
+        assert_eq!(chunks[0].length, data.len() as u64);
+        assert_eq!(chunks[0].hash, *blake3::hash(data).as_bytes());
+    }
+
+    #[test]
+    fn test_chunk_large_data() {
+        // Generate 256KB pattern
+        let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let chunks = chunk(&data);
+        assert!(!chunks.is_empty());
+
+        let mut covered_bytes = 0u64;
+        for c in &chunks {
+            assert_eq!(c.offset, covered_bytes);
+            let slice = &data[c.offset as usize..(c.offset + c.length) as usize];
+            assert_eq!(c.hash, *blake3::hash(slice).as_bytes());
+            covered_bytes += c.length;
+        }
+        assert_eq!(covered_bytes, data.len() as u64);
+    }
+
+    #[test]
+    fn test_to_hashmap_kv() {
+        let chunk_item = FileChunk {
+            hash: [42u8; 32],
+            offset: 10,
+            length: 100,
+        };
+        let (hash, val) = chunk_item.to_hashmap_kv();
+        assert_eq!(hash, [42u8; 32]);
+        assert_eq!(val.offset, 10);
+        assert_eq!(val.length, 100);
+    }
+}
+

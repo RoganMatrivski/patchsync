@@ -214,3 +214,77 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[test]
+    fn test_from_progress_events() {
+        let se = SendEvent::from_bytes(100);
+        match se {
+            SendEvent::Progress { bytes } => assert_eq!(bytes, 100),
+            _ => panic!("Expected SendEvent::Progress"),
+        }
+
+        let re = RecvEvent::from_bytes(200);
+        match re {
+            RecvEvent::Progress { bytes } => assert_eq!(bytes, 200),
+            _ => panic!("Expected RecvEvent::Progress"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tracked_stream_and_msg_roundtrip() -> eyre::Result<()> {
+        let (client_io, server_io) = duplex(1024);
+
+        let (tx_send, rx_send) = flume::unbounded::<SendEvent>();
+        let (tx_recv, rx_recv) = flume::unbounded::<RecvEvent>();
+
+        let mut client_stream = TrackedStream::new(client_io, tx_send);
+        let mut server_stream = TrackedStream::new(server_io, tx_recv);
+
+        let sent_msg = SenderToReceiver::RequestSnapshot;
+
+        // Send msg from client to server
+        tokio::spawn(async move {
+            send_msg(&mut client_stream, &sent_msg).await.unwrap();
+        });
+
+        let recv_msg: SenderToReceiver = recv_msg(&mut server_stream).await?;
+        match recv_msg {
+            SenderToReceiver::RequestSnapshot => {}
+            _ => panic!("Expected RequestSnapshot"),
+        }
+
+        // Verify progress events emitted
+        let send_progress: Vec<_> = rx_send.drain().collect();
+        let recv_progress: Vec<_> = rx_recv.drain().collect();
+        assert!(!send_progress.is_empty());
+        assert!(!recv_progress.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tracked_stream_read_write_closed() -> eyre::Result<()> {
+        let (client_io, server_io) = duplex(1024);
+        let (tx1, _rx1) = flume::unbounded::<SendEvent>();
+        let (tx2, _rx2) = flume::unbounded::<RecvEvent>();
+
+        let mut client_stream = TrackedStream::new(client_io, tx1);
+        let server_stream = TrackedStream::new(server_io, tx2);
+
+        // Close server side
+        drop(server_stream);
+
+        // Writing or reading should fail
+        let mut buf = [0u8; 10];
+        assert!(client_stream.read_exact_tracked(&mut buf).await.is_err());
+
+        Ok(())
+    }
+
+}
+

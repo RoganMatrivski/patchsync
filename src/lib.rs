@@ -303,3 +303,125 @@ impl SendHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::endpoint::{presets, Endpoint};
+    use iroh::protocol::ProtocolHandler;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_end_to_end_sync_protocol() -> eyre::Result<()> {
+        let recv_dir = tempdir()?;
+        let send_dir = tempdir()?;
+
+        // Receiver state: a.txt ("old a"), b.txt ("will delete")
+        let recv_a = recv_dir.path().join("a.txt");
+        let recv_b = recv_dir.path().join("b.txt");
+        std::fs::write(&recv_a, "old a content")?;
+        std::fs::write(&recv_b, "to be deleted")?;
+
+        // Sender state: a.txt ("new a content!"), c.txt ("newly created c")
+        let send_a = send_dir.path().join("a.txt");
+        let send_c = send_dir.path().join("c.txt");
+        std::fs::write(&send_a, "new a content!")?;
+        std::fs::write(&send_c, "newly created c")?;
+
+        // Bind endpoints
+        let recv_ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let send_ep = Endpoint::builder(presets::N0).bind().await?;
+
+        let (recv_tx, recv_rx) = flume::unbounded();
+        let (send_tx, send_rx) = flume::unbounded();
+
+        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_tx);
+
+        // Spawn receiver accept task
+        let recv_ep_clone = recv_ep.clone();
+        let recv_handle = tokio::spawn(async move {
+            let incoming = recv_ep_clone.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_protocol.accept(conn).await.unwrap();
+        });
+
+        // Connect sender
+        let conn = send_ep
+            .connect(recv_ep.addr(), ALPN)
+            .await?;
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+
+        let send_handler = SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        send_handler.send_loop(send_tx).await?;
+
+        recv_handle.await?;
+
+        // Verify receiver files match sender state
+        assert_eq!(std::fs::read_to_string(recv_dir.path().join("a.txt"))?, "new a content!");
+        assert_eq!(std::fs::read_to_string(recv_dir.path().join("c.txt"))?, "newly created c");
+        assert!(!recv_dir.path().join("b.txt").exists());
+
+        // Verify events emitted
+        let recv_events: Vec<_> = rx_drain(recv_rx);
+        let send_events: Vec<_> = rx_drain(send_rx);
+
+        assert!(recv_events.iter().any(|e| matches!(e, RecvEvent::Finished)));
+        assert!(send_events.iter().any(|e| matches!(e, SendEvent::Finished)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sync_no_changes() -> eyre::Result<()> {
+        let recv_dir = tempdir()?;
+        let send_dir = tempdir()?;
+
+        std::fs::write(recv_dir.path().join("same.txt"), "identical content")?;
+        std::fs::write(send_dir.path().join("same.txt"), "identical content")?;
+
+        let recv_ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let send_ep = Endpoint::builder(presets::N0).bind().await?;
+
+        let (recv_tx, _recv_rx) = flume::unbounded();
+        let (send_tx, send_rx) = flume::unbounded();
+
+        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_tx);
+
+        let recv_ep_clone = recv_ep.clone();
+        let recv_handle = tokio::spawn(async move {
+            let incoming = recv_ep_clone.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_protocol.accept(conn).await.unwrap();
+        });
+
+        let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+
+        let send_handler = SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        send_handler.send_loop(send_tx).await?;
+
+        recv_handle.await?;
+
+        let send_events: Vec<_> = rx_drain(send_rx);
+        let diff_event = send_events.iter().find(|e| matches!(e, SendEvent::DiffComputed { .. }));
+        if let Some(SendEvent::DiffComputed { total_entries, .. }) = diff_event {
+            assert_eq!(*total_entries, 0);
+        } else {
+            panic!("Expected DiffComputed event");
+        }
+
+        Ok(())
+    }
+
+    fn rx_drain<T>(rx: flume::Receiver<T>) -> Vec<T> {
+        rx.drain().collect()
+    }
+}
+
+

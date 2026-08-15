@@ -164,6 +164,7 @@ impl SnapshotEntry {
                 }
 
                 drop(filebin);
+                drop(file);
 
                 let mut tempfile =
                     tempfile::NamedTempFile::new_in(p.parent().wrap_err("Path is not a file")?)?;
@@ -319,6 +320,150 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_path_key_conversions() -> eyre::Result<()> {
+        let p = Path::new("foo/bar/baz.txt");
+        let pk1 = PathKey::from(p);
+        let pk2 = PathKey::from(p.to_path_buf());
+        assert_eq!(pk1, pk2);
+
+        let root = Path::new("/root");
+        let full = Path::new("/root/sub/file.txt");
+        let pk_from_paths = PathKey::from_paths(root, full);
+        assert_eq!(pk_from_paths.0, "sub/file.txt");
+
+        let entry = PathEntry::File {
+            path: full.to_path_buf(),
+            chunks: vec![],
+        };
+        let pk_from_entry = PathKey::from_pathentry(root, &entry)?;
+        assert_eq!(pk_from_entry.0, "sub/file.txt");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_patch_instructs_get_length() {
+        let copy_inst = PatchInstructs::Copy {
+            offset: 0,
+            length: 100,
+        };
+        assert_eq!(copy_inst.get_length(), 0);
+
+        let lit_inst = PatchInstructs::Literal {
+            data: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(lit_inst.get_length(), 5);
+    }
+
+    #[test]
+    fn test_snapshot_entry_path_and_debug() {
+        let create = SnapshotEntry::Create {
+            path: PathBuf::from("a.txt"),
+            bytes: vec![1, 2],
+        };
+        assert_eq!(create.path(), Path::new("a.txt"));
+        assert!(format!("{:?}", create).contains("Create"));
+
+        let update = SnapshotEntry::Update {
+            path: PathBuf::from("b.txt"),
+            instructs: vec![],
+        };
+        assert_eq!(update.path(), Path::new("b.txt"));
+        assert!(format!("{:?}", update).contains("Update"));
+
+        let delete = SnapshotEntry::Delete {
+            path: PathBuf::from("c.txt"),
+        };
+        assert_eq!(delete.path(), Path::new("c.txt"));
+        assert!(format!("{:?}", delete).contains("Delete"));
+    }
+
+    #[test]
+    fn test_apply_non_existent_root_bails() {
+        let entry = SnapshotEntry::Delete {
+            path: PathBuf::from("foo"),
+        };
+        assert!(entry.apply("/non/existent/path/for/sure").is_err());
+    }
+
+    #[test]
+    fn test_apply_create_nested_dir() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let create = SnapshotEntry::Create {
+            path: PathBuf::from("nested/deep/file.txt"),
+            bytes: b"deep data".to_vec(),
+        };
+        create.apply(dir.path())?;
+        let target = dir.path().join("nested/deep/file.txt");
+        assert_eq!(std::fs::read_to_string(target)?, "deep data");
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_update_copy_and_literal() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")?;
+
+        // Construct update: Copy 0..5 ("ABCDE"), Literal "123", Copy 20..26 ("UVWXYZ")
+        let update = SnapshotEntry::Update {
+            path: PathBuf::from("file.txt"),
+            instructs: vec![
+                PatchInstructs::Copy {
+                    offset: 0,
+                    length: 5,
+                },
+                PatchInstructs::Literal {
+                    data: b"123".to_vec(),
+                },
+                PatchInstructs::Copy {
+                    offset: 20,
+                    length: 6,
+                },
+            ],
+        };
+        update.apply(dir.path())?;
+        assert_eq!(std::fs::read_to_string(file_path)?, "ABCDE123UVWXYZ");
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_update_out_of_bounds_error() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, "short")?;
+
+        let update = SnapshotEntry::Update {
+            path: PathBuf::from("file.txt"),
+            instructs: vec![PatchInstructs::Copy {
+                offset: 0,
+                length: 1000,
+            }],
+        };
+        assert!(update.apply(dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_delete_edge_cases() -> eyre::Result<()> {
+        let dir = tempdir()?;
+
+        // Empty path delete
+        let empty_del = SnapshotEntry::Delete {
+            path: PathBuf::new(),
+        };
+        empty_del.apply(dir.path())?;
+
+        // Non-existent file delete should not error
+        let non_exist_del = SnapshotEntry::Delete {
+            path: PathBuf::from("ghost.txt"),
+        };
+        non_exist_del.apply(dir.path())?;
+
+        Ok(())
+    }
+
+    #[test]
     fn test_delete_directory_entry() -> eyre::Result<()> {
         let dir = tempdir()?;
         let sub_dir = dir.path().join("subdir");
@@ -382,6 +527,39 @@ mod tests {
     }
 
     #[test]
+    fn test_file_changed_to_dir() -> eyre::Result<()> {
+        let dir = tempdir()?;
+        let item_path = dir.path().join("item");
+        std::fs::write(&item_path, "file content")?;
+
+        let old_entries = crate::dirwalker::walkdir(dir.path())?;
+        let old_map = old_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        std::fs::remove_file(&item_path)?;
+        std::fs::create_dir_all(&item_path)?;
+
+        let new_entries = crate::dirwalker::walkdir(dir.path())?;
+        let new_map = new_entries
+            .into_iter()
+            .map(|x| PathKey::from_pathentry(dir.path(), &x).map(|k| (k, x)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let diff_entries = diff(old_map, new_map)?;
+
+        // Must contain a Delete for item
+        let has_delete = diff_entries.iter().any(|e| match e {
+            SnapshotEntry::Delete { path } => path == Path::new("item"),
+            _ => false,
+        });
+        assert!(has_delete);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_diff_multiple_files_with_unchanged() -> eyre::Result<()> {
         let dir = tempdir()?;
         let file_a = dir.path().join("a.txt");
@@ -413,4 +591,5 @@ mod tests {
         Ok(())
     }
 }
+
 
