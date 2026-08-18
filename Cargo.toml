@@ -41,6 +41,7 @@ postcard.workspace = true
 qbsdiff.workspace = true
 serde.workspace = true
 tempfile = "3.27.0"
+thiserror = "2.0.20"
 tokio.workspace = true
 tracing.workspace = true
 

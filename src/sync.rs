@@ -99,27 +99,27 @@ where
         }
     }
 
-    pub async fn send(&mut self, msg: T) -> eyre::Result<()> {
+    pub async fn send(&mut self, msg: T) -> crate::Result<()> {
         send_msg(&mut self.send, &msg).await
     }
 
-    pub async fn recv(&mut self) -> eyre::Result<R> {
+    pub async fn recv(&mut self) -> crate::Result<R> {
         recv_msg(&mut self.recv).await
     }
 
-    pub async fn finish(&mut self) -> eyre::Result<()> {
+    pub async fn finish(&mut self) -> crate::Result<()> {
         self.send.finish().await
     }
 }
 
 impl<E> TrackedStream<iroh::endpoint::SendStream, E> {
-    pub async fn finish(&mut self) -> eyre::Result<()> {
+    pub async fn finish(&mut self) -> crate::Result<()> {
         self.inner.finish()?;
         Ok(())
     }
 }
 
-async fn send_msg<T, R, P>(stream: &mut TrackedStream<R, P>, msg: &T) -> eyre::Result<()>
+async fn send_msg<T, R, P>(stream: &mut TrackedStream<R, P>, msg: &T) -> crate::Result<()>
 where
     T: Serialize,
     R: tokio::io::AsyncWrite + Unpin,
@@ -133,7 +133,7 @@ where
     Ok(())
 }
 
-async fn recv_msg<T, R, P>(stream: &mut TrackedStream<R, P>) -> eyre::Result<T>
+async fn recv_msg<T, R, P>(stream: &mut TrackedStream<R, P>) -> crate::Result<T>
 where
     T: DeserializeOwned,
     R: tokio::io::AsyncRead + Unpin,
@@ -165,7 +165,7 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     E: FromProgress,
 {
-    pub async fn write_all(&mut self, data: &[u8]) -> eyre::Result<()> {
+    pub async fn write_all(&mut self, data: &[u8]) -> crate::Result<()> {
         use tokio::io::AsyncWriteExt;
 
         let mut sent = 0;
@@ -174,7 +174,7 @@ where
 
             if n == 0 {
                 tracing::error!("Stream closed unexpectedly before all bytes were written");
-                eyre::bail!("stream closed before all bytes were written");
+                return Err(crate::Error::StreamClosedWrite);
             }
             sent += n;
             tracing::trace!(bytes = n, "Stream wrote bytes");
@@ -193,7 +193,7 @@ where
     S: tokio::io::AsyncRead + Unpin,
     E: FromProgress,
 {
-    pub async fn read_exact_tracked(&mut self, buf: &mut [u8]) -> eyre::Result<()> {
+    pub async fn read_exact_tracked(&mut self, buf: &mut [u8]) -> crate::Result<()> {
         use tokio::io::AsyncReadExt;
 
         let mut received = 0;
@@ -201,7 +201,7 @@ where
             let n = self.inner.read(&mut buf[received..]).await?;
             if n == 0 {
                 tracing::debug!("Stream closed during read (EOF or peer shutdown)");
-                eyre::bail!("stream closed before all bytes were received");
+                return Err(crate::Error::StreamClosedRead);
             }
             received += n;
             tracing::trace!(bytes = n, "Stream read bytes");
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tracked_stream_and_msg_roundtrip() -> eyre::Result<()> {
+    async fn test_tracked_stream_and_msg_roundtrip() -> crate::Result<()> {
         let (client_io, server_io) = duplex(1024);
 
         let (tx_send, rx_send) = flume::unbounded::<SendEvent>();
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tracked_stream_read_write_closed() -> eyre::Result<()> {
+    async fn test_tracked_stream_read_write_closed() -> crate::Result<()> {
         let (client_io, server_io) = duplex(1024);
         let (tx1, _rx1) = flume::unbounded::<SendEvent>();
         let (tx2, _rx2) = flume::unbounded::<RecvEvent>();

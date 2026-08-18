@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eyre::ContextCompat;
 use serde::{Deserialize, Serialize};
 
 use crate::dirwalker::PathEntry;
@@ -46,7 +45,7 @@ impl PathKey {
         rel.into()
     }
 
-    pub fn from_pathentry(root: impl AsRef<Path>, entry: &PathEntry) -> eyre::Result<Self> {
+    pub fn from_pathentry(root: impl AsRef<Path>, entry: &PathEntry) -> crate::Result<Self> {
         Ok(entry.into_path_root_trimmed(root.as_ref())?.into())
     }
 }
@@ -112,12 +111,11 @@ impl SnapshotEntry {
         }
     }
 
-    pub fn apply(self, root: impl AsRef<Path>) -> eyre::Result<()> {
+    pub fn apply(self, root: impl AsRef<Path>) -> crate::Result<()> {
         if !root.as_ref().exists() {
-            eyre::bail!(
-                "{} not exist. Aborting patch",
-                root.as_ref().to_string_lossy()
-            )
+            return Err(crate::Error::RootDoesNotExist(
+                root.as_ref().to_path_buf(),
+            ));
         }
 
         match self {
@@ -147,12 +145,11 @@ impl SnapshotEntry {
                             let ulength = length as usize;
 
                             if uoffset + ulength > filebin.len() {
-                                eyre::bail!(
-                                    "Copy instruction bounds error: file len {}, requested range {}..{}",
-                                    filebin.len(),
-                                    uoffset,
-                                    uoffset + ulength
-                                );
+                                return Err(crate::Error::CopyInstructionOutOfBounds {
+                                    file_len: filebin.len(),
+                                    start: uoffset,
+                                    end: uoffset + ulength,
+                                });
                             }
 
                             newfilebin.extend_from_slice(&filebin[uoffset..uoffset + ulength]);
@@ -166,8 +163,10 @@ impl SnapshotEntry {
                 drop(filebin);
                 drop(file);
 
-                let mut tempfile =
-                    tempfile::NamedTempFile::new_in(p.parent().wrap_err("Path is not a file")?)?;
+                let parent = p
+                    .parent()
+                    .ok_or_else(|| crate::Error::NoParentDir(p.clone()))?;
+                let mut tempfile = tempfile::NamedTempFile::new_in(parent)?;
 
                 tempfile.write_all(&newfilebin)?;
                 tempfile.persist(p)?;
@@ -196,7 +195,7 @@ impl SnapshotEntry {
 pub fn diff<K1, K2>(
     old: HashMap<K1, PathEntry>,
     new: HashMap<K2, PathEntry>,
-) -> eyre::Result<Vec<SnapshotEntry>>
+) -> crate::Result<Vec<SnapshotEntry>>
 where
     K1: Into<PathKey> + Eq + Hash,
     K2: Into<PathKey> + Eq + Hash,
@@ -326,7 +325,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_path_key_conversions() -> eyre::Result<()> {
+    fn test_path_key_conversions() -> crate::Result<()> {
         let p = Path::new("foo/bar/baz.txt");
         let pk1 = PathKey::from(p);
         let pk2 = PathKey::from(p.to_path_buf());
@@ -393,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_create_nested_dir() -> eyre::Result<()> {
+    fn test_apply_create_nested_dir() -> crate::Result<()> {
         let dir = tempdir()?;
         let create = SnapshotEntry::Create {
             path: PathBuf::from("nested/deep/file.txt"),
@@ -406,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_update_copy_and_literal() -> eyre::Result<()> {
+    fn test_apply_update_copy_and_literal() -> crate::Result<()> {
         let dir = tempdir()?;
         let file_path = dir.path().join("file.txt");
         std::fs::write(&file_path, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")?;
@@ -434,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_update_out_of_bounds_error() -> eyre::Result<()> {
+    fn test_apply_update_out_of_bounds_error() -> crate::Result<()> {
         let dir = tempdir()?;
         let file_path = dir.path().join("file.txt");
         std::fs::write(&file_path, "short")?;
@@ -451,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_delete_edge_cases() -> eyre::Result<()> {
+    fn test_apply_delete_edge_cases() -> crate::Result<()> {
         let dir = tempdir()?;
 
         // Empty path delete
@@ -470,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_directory_entry() -> eyre::Result<()> {
+    fn test_delete_directory_entry() -> crate::Result<()> {
         let dir = tempdir()?;
         let sub_dir = dir.path().join("subdir");
         std::fs::create_dir_all(&sub_dir)?;
@@ -496,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dir_changed_to_file() -> eyre::Result<()> {
+    fn test_dir_changed_to_file() -> crate::Result<()> {
         let dir = tempdir()?;
         let sub_dir = dir.path().join("item");
         std::fs::create_dir_all(&sub_dir)?;
@@ -533,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_changed_to_dir() -> eyre::Result<()> {
+    fn test_file_changed_to_dir() -> crate::Result<()> {
         let dir = tempdir()?;
         let item_path = dir.path().join("item");
         std::fs::write(&item_path, "file content")?;
@@ -566,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_multiple_files_with_unchanged() -> eyre::Result<()> {
+    fn test_diff_multiple_files_with_unchanged() -> crate::Result<()> {
         let dir = tempdir()?;
         let file_a = dir.path().join("a.txt");
         let file_b = dir.path().join("b.txt");

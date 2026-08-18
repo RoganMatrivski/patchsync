@@ -7,8 +7,11 @@ use crate::{
 
 pub mod chunker;
 pub mod dirwalker;
+pub mod error;
 pub mod snapshot;
 pub mod sync;
+
+pub use error::{Error, Result};
 
 pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/0/";
 
@@ -72,9 +75,8 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         .map(|x| {
                             PathKey::from_pathentry(&self.root, &x)
                                 .map(|k| (k, x))
-                                .map_err(eyre::Error::from)
                         })
-                        .collect::<Result<HashMap<_, _>, eyre::Error>>()
+                        .collect::<Result<HashMap<_, _>, crate::Error>>()
                     {
                         Ok(map) => map,
                         Err(e) => {
@@ -120,13 +122,8 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
 
                         if let Err(e) = item.apply(&self.root) {
-                            let chain = e
-                                .chain()
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join(": ");
                             let err_msg = format!(
-                                "Failed to apply patch entry for {}: {chain}",
+                                "Failed to apply patch entry for {}: {e}",
                                 path.display()
                             );
                             tracing::error!("{err_msg}");
@@ -190,11 +187,11 @@ impl SendHandler {
         send: iroh::endpoint::SendStream,
         recv: iroh::endpoint::RecvStream,
         root: std::path::PathBuf,
-    ) -> eyre::Result<Self> {
+    ) -> crate::Result<Self> {
         Ok(Self { send, recv, root })
     }
 
-    pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> eyre::Result<()> {
+    pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> crate::Result<()> {
         tracing::info!(root = %self.root.display(), "Starting SendHandler sync loop");
         if let Err(e) = tx.send_async(SendEvent::Started).await {
             tracing::warn!("Failed to send SendEvent::Started: {e}");
@@ -227,8 +224,8 @@ impl SendHandler {
                     let new_snapshot = crate::dirwalker::walkdir(&self.root)?;
                     let new = new_snapshot
                         .into_iter()
-                        .map(|x| eyre::Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
-                        .collect::<Result<HashMap<_, _>, eyre::Error>>()?;
+                        .map(|x| Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
+                        .collect::<Result<HashMap<_, _>, crate::Error>>()?;
                     let diff = crate::snapshot::diff(old, new)?;
 
                     if diff.is_empty() {
@@ -295,7 +292,7 @@ impl SendHandler {
                     if let Err(e) = tx.send_async(SendEvent::Error(err.clone())).await {
                         tracing::warn!("Failed to send SendEvent::Error: {e}");
                     }
-                    eyre::bail!("Receiver error: {err}");
+                    return Err(crate::Error::Receiver(err));
                 }
             }
         }
@@ -312,7 +309,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_end_to_end_sync_protocol() -> eyre::Result<()> {
+    async fn test_end_to_end_sync_protocol() -> crate::Result<()> {
         let recv_dir = tempdir()?;
         let send_dir = tempdir()?;
 
@@ -375,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_no_changes() -> eyre::Result<()> {
+    async fn test_sync_no_changes() -> crate::Result<()> {
         let recv_dir = tempdir()?;
         let send_dir = tempdir()?;
 

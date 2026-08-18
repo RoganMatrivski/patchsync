@@ -26,7 +26,7 @@ impl PathEntry {
     pub fn into_path_root_trimmed(
         &self,
         root: impl AsRef<std::path::Path>,
-    ) -> eyre::Result<PathBuf> {
+    ) -> crate::Result<PathBuf> {
         Ok(self.into_path().strip_prefix(root)?.to_owned())
     }
 }
@@ -95,7 +95,7 @@ impl<'s> ParallelVisitorBuilder<'s> for FileVisitorBuilder {
     }
 }
 
-pub fn walkdir(dir: impl Into<PathBuf>) -> eyre::Result<Vec<PathEntry>> {
+pub fn walkdir(dir: impl Into<PathBuf>) -> crate::Result<Vec<PathEntry>> {
     let (tx, rx) = flume::unbounded();
 
     let dir = dir.into();
@@ -116,7 +116,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_path_entry_methods() -> eyre::Result<()> {
+    fn test_path_entry_methods() -> crate::Result<()> {
         let root = PathBuf::from("/tmp/root");
         let dir_entry = PathEntry::Dir {
             path: root.join("sub/dir"),
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_walkdir_empty() -> eyre::Result<()> {
+    fn test_walkdir_empty() -> crate::Result<()> {
         let dir = tempdir()?;
         let entries = walkdir(dir.path())?;
         // walkdir includes the root dir entry itself when ignore walks root
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_walkdir_nested_structure() -> eyre::Result<()> {
+    fn test_walkdir_nested_structure() -> crate::Result<()> {
         let dir = tempdir()?;
         let sub = dir.path().join("a/b");
         std::fs::create_dir_all(&sub)?;
