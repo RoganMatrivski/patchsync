@@ -39,6 +39,9 @@ pub enum Error {
         end: usize,
     },
 
+    #[error("Copy instruction overflow: offset {offset} + length {length} overflows usize")]
+    CopyInstructionOverflow { offset: usize, length: usize },
+
     #[error("Stream closed before all bytes were written")]
     StreamClosedWrite,
 

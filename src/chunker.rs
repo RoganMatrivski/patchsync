@@ -14,22 +14,37 @@ impl FileChunk {
     }
 }
 
-pub fn chunk(data: &[u8]) -> Vec<FileChunk> {
+pub fn chunk(data: &[u8]) -> crate::Result<Vec<FileChunk>> {
     v2020::FastCDC::new(data, 2 << 13, 2 << 14, 2 << 16)
         .into_iter()
         .map(|x| {
-            let (length, offset) = (x.length as u64, x.offset as u64);
-            // TODO: Secure this
-            let partial_data = &data[x.offset..(x.length + x.offset)];
+            let offset = x.offset as usize;
+            let length = x.length as usize;
+
+            let end = offset
+                .checked_add(length)
+                .ok_or(crate::Error::CopyInstructionOverflow { offset, length })?;
+
+            let partial_data =
+                data.get(offset..end)
+                    .ok_or(crate::Error::CopyInstructionOutOfBounds {
+                        file_len: data.len(),
+                        start: offset,
+                        end,
+                    })?;
+
             let hash = *blake3::hash(partial_data).as_bytes();
 
-            FileChunk {
+            let offset = x.offset as u64;
+            let length = x.length as u64;
+
+            Ok(FileChunk {
                 hash,
                 offset,
                 length,
-            }
+            })
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()
 }
 
 #[cfg(test)]
@@ -37,26 +52,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunk_empty_data() {
-        let chunks = chunk(&[]);
+    fn test_chunk_empty_data() -> crate::Result<()> {
+        let chunks = chunk(&[])?;
         assert!(chunks.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_small_data() {
+    fn test_chunk_small_data() -> crate::Result<()> {
         let data = b"hello patchsync world";
-        let chunks = chunk(data);
+        let chunks = chunk(data)?;
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].offset, 0);
         assert_eq!(chunks[0].length, data.len() as u64);
         assert_eq!(chunks[0].hash, *blake3::hash(data).as_bytes());
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_large_data() {
+    fn test_chunk_large_data() -> crate::Result<()> {
         // Generate 256KB pattern
         let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
-        let chunks = chunk(&data);
+        let chunks = chunk(&data)?;
         assert!(!chunks.is_empty());
 
         let mut covered_bytes = 0u64;
@@ -67,6 +84,7 @@ mod tests {
             covered_bytes += c.length;
         }
         assert_eq!(covered_bytes, data.len() as u64);
+        Ok(())
     }
 
     #[test]
@@ -82,4 +100,3 @@ mod tests {
         assert_eq!(val.length, 100);
     }
 }
-

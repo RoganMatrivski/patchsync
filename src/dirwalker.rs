@@ -74,10 +74,30 @@ impl ParallelVisitor for FileVisitor {
 
                     let is_empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
                     let chunks = if is_empty {
-                        crate::chunker::chunk(&[])
+                        match crate::chunker::chunk(&[]) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                tracing::error!(
+                                    path = %e.path().display(),
+                                    ?err,
+                                    "Failed to chunk empty file during directory walk"
+                                );
+                                return ignore::WalkState::Continue;
+                            }
+                        }
                     } else {
                         match unsafe { memmap2::Mmap::map(&file) } {
-                            Ok(filebin) => crate::chunker::chunk(&filebin),
+                            Ok(filebin) => match crate::chunker::chunk(&filebin) {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    tracing::error!(
+                                        path = %e.path().display(),
+                                        ?err,
+                                        "Failed to chunk file during directory walk"
+                                    );
+                                    return ignore::WalkState::Continue;
+                                }
+                            },
                             Err(err) => {
                                 tracing::error!(
                                     path = %e.path().display(),
