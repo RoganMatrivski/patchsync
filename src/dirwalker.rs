@@ -39,35 +39,65 @@ impl ParallelVisitor for FileVisitor {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
         match entry {
             Ok(e) => {
-                if e.file_type().expect("TODO: 'Path' is an stdin").is_dir() {
-                    if let Err(e) = self.tx.send(PathEntry::Dir {
+                let file_type = match e.file_type() {
+                    Some(ft) => ft,
+                    None => {
+                        tracing::warn!(path = %e.path().display(), "Cannot determine file type");
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                if file_type.is_dir() {
+                    if let Err(err) = self.tx.send(PathEntry::Dir {
                         path: e.into_path(),
                     }) {
                         tracing::error!(
-                            ?e,
-                            "Failed to send DirEntry. This should not have happened"
+                            ?err,
+                            "Failed to send DirEntry through channel"
                         );
                         ignore::WalkState::Quit
                     } else {
                         ignore::WalkState::Continue
                     }
                 } else {
-                    let file = std::fs::File::open(e.path()).expect("Failed to read file");
+                    let file = match std::fs::File::open(e.path()) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            tracing::error!(
+                                path = %e.path().display(),
+                                ?err,
+                                "Failed to open file during directory walk"
+                            );
+                            return ignore::WalkState::Continue;
+                        }
+                    };
 
-                    // TODO: Add feature flag to disable memmap2
-                    // Why tho
-                    // SAFETY: File opened for read-only. Shoulda been safe
-                    let filebin = unsafe { memmap2::Mmap::map(&file) }.expect("Failed to map file");
+                    let is_empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+                    let chunks = if is_empty {
+                        crate::chunker::chunk(&[])
+                    } else {
+                        match unsafe { memmap2::Mmap::map(&file) } {
+                            Ok(filebin) => crate::chunker::chunk(&filebin),
+                            Err(err) => {
+                                tracing::error!(
+                                    path = %e.path().display(),
+                                    ?err,
+                                    "Failed to memory map file during directory walk"
+                                );
+                                return ignore::WalkState::Continue;
+                            }
+                        }
+                    };
 
                     let fileentry = PathEntry::File {
                         path: e.into_path(),
-                        chunks: crate::chunker::chunk(&filebin),
+                        chunks,
                     };
 
-                    if let Err(e) = self.tx.send(fileentry) {
+                    if let Err(err) = self.tx.send(fileentry) {
                         tracing::error!(
-                            ?e,
-                            "Failed to send DirEntry. This should not have happened"
+                            ?err,
+                            "Failed to send FileEntry through channel"
                         );
                         ignore::WalkState::Quit
                     } else {
@@ -76,7 +106,7 @@ impl ParallelVisitor for FileVisitor {
                 }
             }
             Err(err) => {
-                tracing::warn!(?err, "Failed to access");
+                tracing::warn!(?err, "Failed to access path during directory walk");
                 ignore::WalkState::Continue
             }
         }
@@ -96,12 +126,18 @@ impl<'s> ParallelVisitorBuilder<'s> for FileVisitorBuilder {
 }
 
 pub fn walkdir(dir: impl Into<PathBuf>) -> crate::Result<Vec<PathEntry>> {
+    let dir = dir.into();
+    if !dir.exists() {
+        tracing::error!(path = %dir.display(), "Directory does not exist for walkdir");
+        return Err(crate::Error::RootDoesNotExist(dir));
+    }
+
     let (tx, rx) = flume::unbounded();
 
-    let dir = dir.into();
+    let walk_dir = dir.clone();
     thread::spawn(move || {
         let mut builder = FileVisitorBuilder { tx };
-        ignore::WalkBuilder::new(dir)
+        ignore::WalkBuilder::new(walk_dir)
             .git_ignore(false)
             .build_parallel()
             .visit(&mut builder);
@@ -198,6 +234,12 @@ mod tests {
         assert!(found_sub);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_walkdir_non_existent() {
+        let res = walkdir("/non/existent/path/for/sure/12345");
+        assert!(res.is_err());
     }
 }
 
