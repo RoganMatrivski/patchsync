@@ -91,7 +91,7 @@ async fn handle_send(
                 patchsync::sync::SendEvent::DiffComputed { total_bytes, .. } => {
                     pb.disable_steady_tick();
                     pb.set_style(indicatif::ProgressStyle::with_template(
-                        "{spinner:.green} {msg:20} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {eta}"
+                        "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {eta}"
                     ).expect("Failed to set PB style")
                     .progress_chars("=>-"));
                     pb.set_length(total_bytes);
