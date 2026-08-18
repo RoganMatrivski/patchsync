@@ -261,11 +261,17 @@ where
                     }
                 }
 
-                if instructs.is_empty()
-                    || instructs
+                // Claude says: Since FastCDC will deterministically spits out
+                //              same chunk length and order, just zip and do
+                //              equal compare
+
+                let unchanged = old_chunks.len() == new_chunks.len()
+                    && old_chunks
                         .iter()
-                        .all(|x| matches!(x, PatchInstructs::Copy { .. }))
-                {
+                        .zip(new_chunks.iter())
+                        .all(|(o, n)| o.hash == n.hash);
+
+                if unchanged {
                     continue;
                 }
 
@@ -591,5 +597,3 @@ mod tests {
         Ok(())
     }
 }
-
-
