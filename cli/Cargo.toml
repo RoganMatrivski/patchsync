@@ -11,14 +11,18 @@ mimalloc.workspace = true
 [dependencies]
 patchsync.workspace = true
 
+# Shared
+flume.workspace = true
+iroh.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal", "fs"] }
+tracing.workspace = true
+
+# CLI only
 clap.workspace = true
 color-eyre.workspace = true
 eyre.workspace = true
-iroh.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal"] }
-tracing.workspace = true
+indicatif.workspace = true
+iroh-tickets.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
-flume.workspace = true
-indicatif = "0.18.6"
-iroh-tickets = "1.0.0"
+
