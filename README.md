@@ -1,6 +1,6 @@
 # Patchsync
 
-Sync folders (and file), rsync-like, through Iroh network.
+Sync directory (or a file) through Iroh network, in an rsync-like manner.
 
 > [!WARNING]
 > This library API may change!
