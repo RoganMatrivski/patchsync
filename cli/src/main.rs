@@ -58,13 +58,30 @@ async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
         .accept(patchsync::ALPN, proto)
         .spawn();
 
-    let _recv_evloop = tokio::spawn(async move {
-        for _e in rx {
-            // no-op
+    // Courtesy of ChatGPT
+    tokio::select! {
+        _ = async {
+            while let Ok(ev) = rx.recv_async().await {
+                match ev {
+                    patchsync::sync::RecvEvent::Finished => {
+                        println!("Sync completed successfully.");
+                        break;
+                    }
+                    patchsync::sync::RecvEvent::Error(err) => {
+                        eprintln!("Sync failed: {err}");
+                        break;
+                    }
+                    ev => {
+                        // Handle progress or other events if desired
+                        tracing::debug!("RECV event: {ev:?}");
+                    }
+                }
+            }
+        } => {}
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nShutdown requested by user (Ctrl+C)...");
         }
-    });
-
-    tokio::signal::ctrl_c().await?;
+    }
 
     router.shutdown().await?;
 
