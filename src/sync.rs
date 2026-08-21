@@ -31,15 +31,8 @@ pub enum SendEvent {
         total_entries: usize,
         total_bytes: u64,
     },
-    EntryStarted {
-        index: usize,
-        path: PathBuf,
-    },
     Progress {
         bytes: usize,
-    },
-    EntryFinished {
-        index: usize,
     },
     Finished,
     Error(String),
@@ -285,6 +278,4 @@ mod tests {
 
         Ok(())
     }
-
 }
-
