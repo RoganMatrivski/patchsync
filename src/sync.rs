@@ -42,9 +42,11 @@ pub enum SendEvent {
 pub enum RecvEvent {
     Started,
     SnapshotSent { entry_count: usize },
+    EntryPreApply,
     EntryReceiving { path: PathBuf },
     Progress { bytes: usize },
     EntryApplied { path: PathBuf },
+    EntryPostApply,
     Finished,
     Error(String),
 }

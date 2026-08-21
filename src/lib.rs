@@ -72,10 +72,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                     let old = match old_snapshot
                         .into_iter()
-                        .map(|x| {
-                            PathKey::from_pathentry(&self.root, &x)
-                                .map(|k| (k, x))
-                        })
+                        .map(|x| PathKey::from_pathentry(&self.root, &x).map(|k| (k, x)))
                         .collect::<Result<HashMap<_, _>, crate::Error>>()
                     {
                         Ok(map) => map,
@@ -108,6 +105,10 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 SenderToReceiver::SendPatch(items) => {
                     tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
+                    if let Err(e) = self.tx.send_async(RecvEvent::EntryPreApply).await {
+                        tracing::warn!("Failed to send EntryPreApply event: {e}");
+                    }
+
                     let mut apply_failed = false;
                     for item in items {
                         let path = item.path().to_path_buf();
@@ -122,10 +123,8 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
 
                         if let Err(e) = item.apply(&self.root) {
-                            let err_msg = format!(
-                                "Failed to apply patch entry for {}: {e}",
-                                path.display()
-                            );
+                            let err_msg =
+                                format!("Failed to apply patch entry for {}: {e}", path.display());
                             tracing::error!("{err_msg}");
                             let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
                             let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
@@ -141,6 +140,10 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                     if apply_failed {
                         break;
+                    }
+
+                    if let Err(e) = self.tx.send_async(RecvEvent::EntryPostApply).await {
+                        tracing::warn!("Failed to send EntryPostApply event: {e}");
                     }
 
                     tracing::info!("All patches applied successfully, sending Ack");
@@ -229,7 +232,9 @@ impl SendHandler {
                     let diff = crate::snapshot::diff(old, new)?;
 
                     if diff.is_empty() {
-                        tracing::info!("No changes detected; notifying receiver and finishing sync");
+                        tracing::info!(
+                            "No changes detected; notifying receiver and finishing sync"
+                        );
                         if let Err(e) = tx
                             .send_async(SendEvent::DiffComputed {
                                 total_entries: 0,
@@ -304,7 +309,7 @@ impl SendHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::endpoint::{presets, Endpoint};
+    use iroh::endpoint::{Endpoint, presets};
     use iroh::protocol::ProtocolHandler;
     use tempfile::tempdir;
 
@@ -346,19 +351,24 @@ mod tests {
         });
 
         // Connect sender
-        let conn = send_ep
-            .connect(recv_ep.addr(), ALPN)
-            .await?;
+        let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
 
-        let send_handler = SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        let send_handler =
+            SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
         send_handler.send_loop(send_tx).await?;
 
         recv_handle.await?;
 
         // Verify receiver files match sender state
-        assert_eq!(std::fs::read_to_string(recv_dir.path().join("a.txt"))?, "new a content!");
-        assert_eq!(std::fs::read_to_string(recv_dir.path().join("c.txt"))?, "newly created c");
+        assert_eq!(
+            std::fs::read_to_string(recv_dir.path().join("a.txt"))?,
+            "new a content!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(recv_dir.path().join("c.txt"))?,
+            "newly created c"
+        );
         assert!(!recv_dir.path().join("b.txt").exists());
 
         // Verify events emitted
@@ -400,13 +410,16 @@ mod tests {
         let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
 
-        let send_handler = SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        let send_handler =
+            SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
         send_handler.send_loop(send_tx).await?;
 
         recv_handle.await?;
 
         let send_events: Vec<_> = rx_drain(send_rx);
-        let diff_event = send_events.iter().find(|e| matches!(e, SendEvent::DiffComputed { .. }));
+        let diff_event = send_events
+            .iter()
+            .find(|e| matches!(e, SendEvent::DiffComputed { .. }));
         if let Some(SendEvent::DiffComputed { total_entries, .. }) = diff_event {
             assert_eq!(*total_entries, 0);
         } else {
@@ -420,5 +433,3 @@ mod tests {
         rx.drain().collect()
     }
 }
-
-
