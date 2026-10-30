@@ -69,7 +69,10 @@ async fn handle_recv(AppConfig { root, keep_open }: AppConfig) -> eyre::Result<(
     let ticket = iroh_tickets::endpoint::EndpointTicket::new(ep.addr());
     println!("TICKET: {ticket}");
     let (tx, rx) = flume::unbounded();
-    let proto = RecvProtocol::new(root, tx);
+    let tx_clone = tx.clone();
+    let proto = RecvProtocol::new(root, move |ev| {
+        let _ = tx_clone.send(ev);
+    });
     let router = iroh::protocol::Router::builder(ep)
         .accept(patchsync::ALPN, proto)
         .spawn();
@@ -109,7 +112,7 @@ async fn handle_recv(AppConfig { root, keep_open }: AppConfig) -> eyre::Result<(
 }
 
 async fn handle_send(
-    AppConfig { root, keep_open }: AppConfig,
+    AppConfig { root, keep_open: _ }: AppConfig,
     ticket: iroh_tickets::endpoint::EndpointTicket,
 ) -> eyre::Result<()> {
     let ep = iroh::Endpoint::builder(presets::N0).bind().await?;
@@ -145,7 +148,12 @@ async fn handle_send(
         }
     });
 
-    let res = handler.send_loop(evtx).await;
+    let evtx_clone = evtx.clone();
+    let res = handler
+        .send_loop(move |ev| {
+            let _ = evtx_clone.send(ev);
+        })
+        .await;
     let _ = ep.close().await;
     res?;
 

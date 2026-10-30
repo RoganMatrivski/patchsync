@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
+    event::Dispatcher,
     snapshot::PathKey,
     sync::{EventStreamHandler, ReceiverToSender, RecvEvent, SendEvent, SenderToReceiver},
 };
@@ -8,22 +10,35 @@ use crate::{
 pub mod chunker;
 pub mod dirwalker;
 pub mod error;
+pub mod event;
 pub mod snapshot;
 pub mod sync;
 
 pub use error::{Error, Result};
+pub use event::EventHandler;
 
 pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/0/";
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct RecvProtocol {
     pub root: std::path::PathBuf,
-    pub tx: flume::Sender<RecvEvent>,
+    handler: Arc<dyn EventHandler<RecvEvent>>,
+}
+
+impl std::fmt::Debug for RecvProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvProtocol")
+            .field("root", &self.root)
+            .finish()
+    }
 }
 
 impl RecvProtocol {
-    pub fn new(root: std::path::PathBuf, tx: flume::Sender<RecvEvent>) -> Self {
-        Self { root, tx }
+    pub fn new(root: std::path::PathBuf, handler: impl EventHandler<RecvEvent>) -> Self {
+        Self {
+            root,
+            handler: Arc::new(handler),
+        }
     }
 }
 
@@ -32,150 +47,145 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        tracing::info!(peer = %connection.remote_id(), "Accepting incoming connection for RecvProtocol");
-        let (send, recv) = connection.accept_bi().await?;
+        let dispatcher = Dispatcher::spawn(Arc::clone(&self.handler));
+        let sink = dispatcher.sink();
 
-        if let Err(e) = self.tx.send_async(RecvEvent::Started).await {
-            tracing::warn!("Failed to send RecvEvent::Started: {e}");
-        }
+        sink.emit(RecvEvent::Started);
 
-        let mut ev_handler =
-            EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
-                send,
-                recv,
-                self.tx.clone(),
-            );
+        let result = async {
+            tracing::info!(peer = %connection.remote_id(), "Accepting incoming connection for RecvProtocol");
+            let (send, recv) = connection.accept_bi().await?;
 
-        loop {
-            let msg = match ev_handler.recv().await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::warn!("Connection closed or failed to receive message: {e}");
-                    let _ = self.tx.send_async(RecvEvent::Error(e.to_string())).await;
-                    break;
-                }
-            };
+            let mut ev_handler =
+                EventStreamHandler::<ReceiverToSender, SenderToReceiver, RecvEvent>::new(
+                    send,
+                    recv,
+                    sink.clone(),
+                );
 
-            match msg {
-                SenderToReceiver::RequestSnapshot => {
-                    tracing::trace!("Received RequestSnapshot from sender");
-                    let old_snapshot = match crate::dirwalker::walkdir(&self.root) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let err_msg = format!("Failed to walk root directory: {e}");
-                            tracing::error!("{err_msg}");
-                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
-                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
-                            break;
-                        }
-                    };
-
-                    let old = match old_snapshot
-                        .into_iter()
-                        .map(|x| PathKey::from_pathentry(&self.root, &x).map(|k| (k, x)))
-                        .collect::<Result<HashMap<_, _>, crate::Error>>()
-                    {
-                        Ok(map) => map,
-                        Err(e) => {
-                            let err_msg = format!("Failed to build snapshot map: {e}");
-                            tracing::error!("{err_msg}");
-                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
-                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
-                            break;
-                        }
-                    };
-
-                    let entry_count = old.len();
-                    tracing::debug!(entry_count, "Generated snapshot, sending to peer");
-
-                    if let Err(e) = ev_handler.send(ReceiverToSender::Snapshot(old)).await {
-                        tracing::error!("Failed to send snapshot to peer: {e}");
-                        let _ = self.tx.send_async(RecvEvent::Error(e.to_string())).await;
+            loop {
+                let msg = match ev_handler.recv().await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::warn!("Connection closed or failed to receive message: {e}");
+                        sink.emit(RecvEvent::Error(e.to_string()));
                         break;
                     }
+                };
 
-                    if let Err(e) = self
-                        .tx
-                        .send_async(RecvEvent::SnapshotSent { entry_count })
-                        .await
-                    {
-                        tracing::warn!("Failed to send SnapshotSent event: {e}");
-                    }
-                }
-                SenderToReceiver::SendPatch(items) => {
-                    tracing::info!(item_count = items.len(), "Receiving patches from sender");
+                match msg {
+                    SenderToReceiver::RequestSnapshot => {
+                        tracing::trace!("Received RequestSnapshot from sender");
+                        let old_snapshot = match crate::dirwalker::walkdir(&self.root) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let err_msg = format!("Failed to walk root directory: {e}");
+                                tracing::error!("{err_msg}");
+                                sink.emit(RecvEvent::Error(err_msg.clone()));
+                                let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                break;
+                            }
+                        };
 
-                    if let Err(e) = self.tx.send_async(RecvEvent::EntryPreApply).await {
-                        tracing::warn!("Failed to send EntryPreApply event: {e}");
-                    }
-
-                    let mut apply_failed = false;
-                    for item in items {
-                        let path = item.path().to_path_buf();
-                        tracing::debug!(path = %path.display(), "Receiving entry patch");
-
-                        if let Err(e) = self
-                            .tx
-                            .send_async(RecvEvent::EntryReceiving { path: path.clone() })
-                            .await
+                        let old = match old_snapshot
+                            .into_iter()
+                            .map(|x| PathKey::from_pathentry(&self.root, &x).map(|k| (k, x)))
+                            .collect::<Result<HashMap<_, _>, crate::Error>>()
                         {
-                            tracing::warn!("Failed to send EntryReceiving event: {e}");
-                        }
+                            Ok(map) => map,
+                            Err(e) => {
+                                let err_msg = format!("Failed to build snapshot map: {e}");
+                                tracing::error!("{err_msg}");
+                                sink.emit(RecvEvent::Error(err_msg.clone()));
+                                let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                break;
+                            }
+                        };
 
-                        if let Err(e) = item.apply(&self.root) {
-                            let err_msg =
-                                format!("Failed to apply patch entry for {}: {e}", path.display());
-                            tracing::error!("{err_msg}");
-                            let _ = self.tx.send_async(RecvEvent::Error(err_msg.clone())).await;
-                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
-                            apply_failed = true;
+                        let entry_count = old.len();
+                        tracing::debug!(entry_count, "Generated snapshot, sending to peer");
+
+                        if let Err(e) = ev_handler.send(ReceiverToSender::Snapshot(old)).await {
+                            tracing::error!("Failed to send snapshot to peer: {e}");
+                            sink.emit(RecvEvent::Error(e.to_string()));
                             break;
                         }
 
-                        tracing::debug!(path = %path.display(), "Patch entry applied successfully");
-                        if let Err(e) = self.tx.send_async(RecvEvent::EntryApplied { path }).await {
-                            tracing::warn!("Failed to send EntryApplied event: {e}");
-                        }
+                        sink.emit(RecvEvent::SnapshotSent { entry_count });
                     }
+                    SenderToReceiver::SendPatch(items) => {
+                        tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
-                    if apply_failed {
+                        sink.emit(RecvEvent::EntryPreApply);
+
+                        let mut apply_failed = false;
+                        for item in items {
+                            let path = item.path().to_path_buf();
+                            tracing::debug!(path = %path.display(), "Receiving entry patch");
+
+                            sink.emit(RecvEvent::EntryReceiving { path: path.clone() });
+
+                            if let Err(e) = item.apply(&self.root) {
+                                let err_msg =
+                                    format!("Failed to apply patch entry for {}: {e}", path.display());
+                                tracing::error!("{err_msg}");
+                                sink.emit(RecvEvent::Error(err_msg.clone()));
+                                let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                apply_failed = true;
+                                break;
+                            }
+
+                            tracing::debug!(path = %path.display(), "Patch entry applied successfully");
+                            sink.emit(RecvEvent::EntryApplied { path });
+                        }
+
+                        if apply_failed {
+                            break;
+                        }
+
+                        sink.emit(RecvEvent::EntryPostApply);
+
+                        tracing::info!("All patches applied successfully, sending Ack");
+                        if let Err(e) = ev_handler.send(ReceiverToSender::Ack).await {
+                            tracing::warn!("Failed to send Ack: {e}");
+                        }
+                        if let Err(e) = ev_handler.finish().await {
+                            tracing::warn!("Failed to finish stream: {e}");
+                        }
+
+                        sink.emit(RecvEvent::Finished);
+
+                        // Wait for sender to read Ack and close stream
+                        tracing::trace!("Waiting for sender to close stream after Ack");
+                        let _ = ev_handler.recv().await;
+                        tracing::info!("RecvProtocol stream completed cleanly");
                         break;
                     }
-
-                    if let Err(e) = self.tx.send_async(RecvEvent::EntryPostApply).await {
-                        tracing::warn!("Failed to send EntryPostApply event: {e}");
+                    SenderToReceiver::Ack => {
+                        tracing::trace!("Received Ack from peer");
+                        let _ = ev_handler.finish().await;
+                        sink.emit(RecvEvent::Finished);
+                        break;
                     }
-
-                    tracing::info!("All patches applied successfully, sending Ack");
-                    if let Err(e) = ev_handler.send(ReceiverToSender::Ack).await {
-                        tracing::warn!("Failed to send Ack: {e}");
-                    }
-                    if let Err(e) = ev_handler.finish().await {
-                        tracing::warn!("Failed to finish stream: {e}");
-                    }
-
-                    if let Err(e) = self.tx.send_async(RecvEvent::Finished).await {
-                        tracing::warn!("Failed to send RecvEvent::Finished: {e}");
-                    }
-
-                    // Wait for sender to read Ack and close stream
-                    tracing::trace!("Waiting for sender to close stream after Ack");
-                    let _ = ev_handler.recv().await;
-                    tracing::info!("RecvProtocol stream completed cleanly");
-                    break;
                 }
-                SenderToReceiver::Ack => {
-                    tracing::trace!("Received Ack from peer");
-                    let _ = ev_handler.finish().await;
-                    if let Err(e) = self.tx.send_async(RecvEvent::Finished).await {
-                        tracing::warn!("Failed to send RecvEvent::Finished: {e}");
-                    }
-                    break;
-                }
+            }
+            Ok::<(), iroh::protocol::AcceptError>(())
+        }
+        .await;
+
+        match &result {
+            Ok(()) => {}
+            Err(e) => {
+                sink.emit(RecvEvent::Error(e.to_string()));
             }
         }
 
-        Ok(())
+        drop(sink);
+        if let Err(e) = tokio::task::spawn_blocking(move || dispatcher.shutdown()).await {
+            tracing::error!("Failed to join dispatcher thread: {e}");
+        }
+
+        result
     }
 }
 
@@ -194,115 +204,113 @@ impl SendHandler {
         Ok(Self { send, recv, root })
     }
 
-    pub async fn send_loop(self, tx: flume::Sender<SendEvent>) -> crate::Result<()> {
-        tracing::info!(root = %self.root.display(), "Starting SendHandler sync loop");
-        if let Err(e) = tx.send_async(SendEvent::Started).await {
-            tracing::warn!("Failed to send SendEvent::Started: {e}");
-        }
+    pub async fn send_loop(self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
+        let dispatcher = Dispatcher::spawn(handler);
+        let sink = dispatcher.sink();
 
-        let mut ev_handler =
-            EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
-                self.send,
-                self.recv,
-                tx.clone(),
-            );
+        sink.emit(SendEvent::Started);
 
-        tracing::trace!("Sending RequestSnapshot to receiver");
-        ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
+        let result = async {
+            tracing::info!(root = %self.root.display(), "Starting SendHandler sync loop");
 
-        loop {
-            match ev_handler.recv().await? {
-                ReceiverToSender::Snapshot(old) => {
-                    tracing::debug!(entry_count = old.len(), "Received snapshot from receiver");
-                    if let Err(e) = tx
-                        .send_async(SendEvent::SnapshotReceived {
+            let mut ev_handler =
+                EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
+                    self.send,
+                    self.recv,
+                    sink.clone(),
+                );
+
+            tracing::trace!("Sending RequestSnapshot to receiver");
+            ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
+
+            loop {
+                match ev_handler.recv().await? {
+                    ReceiverToSender::Snapshot(old) => {
+                        tracing::debug!(entry_count = old.len(), "Received snapshot from receiver");
+                        sink.emit(SendEvent::SnapshotReceived {
                             entry_count: old.len(),
-                        })
-                        .await
-                    {
-                        tracing::warn!("Failed to send SnapshotReceived event: {e}");
-                    }
+                        });
 
-                    tracing::trace!("Walking local directory and computing diff");
-                    let new_snapshot = crate::dirwalker::walkdir(&self.root)?;
-                    let new = new_snapshot
-                        .into_iter()
-                        .map(|x| Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
-                        .collect::<Result<HashMap<_, _>, crate::Error>>()?;
-                    let diff = crate::snapshot::diff(old, new)?;
+                        tracing::trace!("Walking local directory and computing diff");
+                        let new_snapshot = crate::dirwalker::walkdir(&self.root)?;
+                        let new = new_snapshot
+                            .into_iter()
+                            .map(|x| Ok((PathKey::from_pathentry(&self.root, &x)?, x)))
+                            .collect::<Result<HashMap<_, _>, crate::Error>>()?;
+                        let diff = crate::snapshot::diff(old, new)?;
 
-                    if diff.is_empty() {
-                        tracing::info!(
-                            "No changes detected; notifying receiver and finishing sync"
-                        );
-                        if let Err(e) = tx
-                            .send_async(SendEvent::DiffComputed {
+                        if diff.is_empty() {
+                            tracing::info!(
+                                "No changes detected; notifying receiver and finishing sync"
+                            );
+                            sink.emit(SendEvent::DiffComputed {
                                 total_entries: 0,
                                 total_bytes: 0,
+                            });
+
+                            ev_handler.send(SenderToReceiver::Ack).await?;
+                            ev_handler.finish().await?;
+                            sink.emit(SendEvent::Finished);
+                            break;
+                        }
+
+                        let total_entries = diff.len();
+                        let total_bytes = diff
+                            .iter()
+                            .map(|item| match item {
+                                snapshot::SnapshotEntry::Create { bytes, .. } => bytes.len() as u64,
+                                snapshot::SnapshotEntry::Update { instructs, .. } => {
+                                    instructs.iter().map(|x| x.get_length()).sum::<u64>()
+                                }
+                                snapshot::SnapshotEntry::Delete { .. } => 0,
                             })
-                            .await
-                        {
-                            tracing::warn!("Failed to send DiffComputed event: {e}");
-                        }
+                            .sum();
 
-                        ev_handler.send(SenderToReceiver::Ack).await?;
-                        ev_handler.finish().await?;
-                        if let Err(e) = tx.send_async(SendEvent::Finished).await {
-                            tracing::warn!("Failed to send SendEvent::Finished: {e}");
-                        }
-                        break;
-                    }
+                        tracing::info!(
+                            total_entries = total_entries,
+                            total_bytes = total_bytes,
+                            "Computed diff for patch sync"
+                        );
 
-                    let total_entries = diff.len();
-                    let total_bytes = diff
-                        .iter()
-                        .map(|item| match item {
-                            snapshot::SnapshotEntry::Create { bytes, .. } => bytes.len() as u64,
-                            snapshot::SnapshotEntry::Update { instructs, .. } => {
-                                instructs.iter().map(|x| x.get_length()).sum::<u64>()
-                            }
-                            snapshot::SnapshotEntry::Delete { .. } => 0,
-                        })
-                        .sum();
-
-                    tracing::info!(
-                        total_entries = total_entries,
-                        total_bytes = total_bytes,
-                        "Computed diff for patch sync"
-                    );
-
-                    if let Err(e) = tx
-                        .send_async(SendEvent::DiffComputed {
+                        sink.emit(SendEvent::DiffComputed {
                             total_entries,
                             total_bytes,
-                        })
-                        .await
-                    {
-                        tracing::warn!("Failed to send DiffComputed event: {e}");
-                    }
+                        });
 
-                    tracing::debug!("Sending patch items to receiver");
-                    ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
-                }
-                ReceiverToSender::Ack => {
-                    tracing::info!("Received Ack from receiver, sync finished successfully");
-                    ev_handler.finish().await?;
-                    if let Err(e) = tx.send_async(SendEvent::Finished).await {
-                        tracing::warn!("Failed to send SendEvent::Finished: {e}");
+                        tracing::debug!("Sending patch items to receiver");
+                        ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
                     }
-                    break;
-                }
-                ReceiverToSender::Error(err) => {
-                    tracing::error!(error = %err, "Received error from receiver");
-                    if let Err(e) = tx.send_async(SendEvent::Error(err.clone())).await {
-                        tracing::warn!("Failed to send SendEvent::Error: {e}");
+                    ReceiverToSender::Ack => {
+                        tracing::info!("Received Ack from receiver, sync finished successfully");
+                        ev_handler.finish().await?;
+                        sink.emit(SendEvent::Finished);
+                        break;
                     }
-                    return Err(crate::Error::Receiver(err));
+                    ReceiverToSender::Error(err) => {
+                        tracing::error!(error = %err, "Received error from receiver");
+                        sink.emit(SendEvent::Error(err.clone()));
+                        return Err(crate::Error::Receiver(err));
+                    }
                 }
+            }
+
+            Ok::<(), crate::Error>(())
+        }
+        .await;
+
+        match &result {
+            Ok(()) => {}
+            Err(e) => {
+                sink.emit(SendEvent::Error(e.to_string()));
             }
         }
 
-        Ok(())
+        drop(sink);
+        if let Err(e) = tokio::task::spawn_blocking(move || dispatcher.shutdown()).await {
+            tracing::error!("Failed to join dispatcher thread: {e}");
+        }
+
+        result
     }
 }
 
@@ -311,6 +319,7 @@ mod tests {
     use super::*;
     use iroh::endpoint::{Endpoint, presets};
     use iroh::protocol::ProtocolHandler;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -337,10 +346,19 @@ mod tests {
             .await?;
         let send_ep = Endpoint::builder(presets::N0).bind().await?;
 
-        let (recv_tx, recv_rx) = flume::unbounded();
-        let (send_tx, send_rx) = flume::unbounded();
+        let recv_events = Arc::new(Mutex::new(Vec::new()));
+        let recv_events_c = Arc::clone(&recv_events);
+        let recv_handler = move |e: RecvEvent| {
+            recv_events_c.lock().unwrap().push(e);
+        };
 
-        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_tx);
+        let send_events = Arc::new(Mutex::new(Vec::new()));
+        let send_events_c = Arc::clone(&send_events);
+        let send_handler_fn = move |e: SendEvent| {
+            send_events_c.lock().unwrap().push(e);
+        };
+
+        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_handler);
 
         // Spawn receiver accept task
         let recv_ep_clone = recv_ep.clone();
@@ -356,7 +374,7 @@ mod tests {
 
         let send_handler =
             SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
-        send_handler.send_loop(send_tx).await?;
+        send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
 
@@ -372,11 +390,29 @@ mod tests {
         assert!(!recv_dir.path().join("b.txt").exists());
 
         // Verify events emitted
-        let recv_events: Vec<_> = rx_drain(recv_rx);
-        let send_events: Vec<_> = rx_drain(send_rx);
+        let recv_recorded = recv_events.lock().unwrap();
+        let send_recorded = send_events.lock().unwrap();
 
-        assert!(recv_events.iter().any(|e| matches!(e, RecvEvent::Finished)));
-        assert!(send_events.iter().any(|e| matches!(e, SendEvent::Finished)));
+        assert!(
+            recv_recorded
+                .iter()
+                .any(|e| matches!(e, RecvEvent::Finished))
+        );
+        assert!(
+            send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::Finished))
+        );
+        assert!(
+            recv_recorded
+                .iter()
+                .any(|e| matches!(e, RecvEvent::Progress { .. }))
+        );
+        assert!(
+            send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::Progress { .. }))
+        );
 
         Ok(())
     }
@@ -395,10 +431,14 @@ mod tests {
             .await?;
         let send_ep = Endpoint::builder(presets::N0).bind().await?;
 
-        let (recv_tx, _recv_rx) = flume::unbounded();
-        let (send_tx, send_rx) = flume::unbounded();
+        let recv_handler = |_: RecvEvent| {};
+        let send_events = Arc::new(Mutex::new(Vec::new()));
+        let send_events_c = Arc::clone(&send_events);
+        let send_handler_fn = move |e: SendEvent| {
+            send_events_c.lock().unwrap().push(e);
+        };
 
-        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_tx);
+        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), recv_handler);
 
         let recv_ep_clone = recv_ep.clone();
         let recv_handle = tokio::spawn(async move {
@@ -412,12 +452,12 @@ mod tests {
 
         let send_handler =
             SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
-        send_handler.send_loop(send_tx).await?;
+        send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
 
-        let send_events: Vec<_> = rx_drain(send_rx);
-        let diff_event = send_events
+        let send_recorded = send_events.lock().unwrap();
+        let diff_event = send_recorded
             .iter()
             .find(|e| matches!(e, SendEvent::DiffComputed { .. }));
         if let Some(SendEvent::DiffComputed { total_entries, .. }) = diff_event {
@@ -426,10 +466,12 @@ mod tests {
             panic!("Expected DiffComputed event");
         }
 
-        Ok(())
-    }
+        assert!(
+            send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::Progress { .. }))
+        );
 
-    fn rx_drain<T>(rx: flume::Receiver<T>) -> Vec<T> {
-        rx.drain().collect()
+        Ok(())
     }
 }
