@@ -114,19 +114,54 @@ async fn handle_send(
     AppConfig { root, keep_open }: AppConfig,
     ticket: iroh_tickets::endpoint::EndpointTicket,
 ) -> eyre::Result<()> {
-    let ep = iroh::Endpoint::builder(presets::N0).bind().await?;
-    let conn = ep.connect(ticket, patchsync::ALPN).await?;
+    // Keep-alives stop idle timeouts from killing the connection between syncs,
+    // and a generous idle timeout lets it ride out short network drops.
+    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(std::time::Duration::from_secs(5))
+        .max_idle_timeout(Some(
+            std::time::Duration::from_secs(60)
+                .try_into()
+                .expect("idle timeout fits in IdleTimeout"),
+        ))
+        .build();
+
+    let ep = iroh::Endpoint::builder(presets::N0)
+        .transport_config(transport_config)
+        .bind()
+        .await?;
+
+    // One-shot: give up after a few attempts. Watch mode: keep trying forever.
+    let max_attempts = if keep_open { None } else { Some(5) };
+    let mut conn = connect_with_retry(&ep, &ticket, max_attempts).await?;
 
     let (run_tx, run_rx) = flume::unbounded::<()>();
 
     let root_clone = root.clone();
+    let ep_task = ep.clone();
     let mut runner = tokio::spawn(async move {
         while run_rx.recv_async().await.is_ok() {
-            if let Err(e) = run_once(&conn, root_clone.clone()).await {
-                if keep_open {
-                    tracing::error!("Sync failed: {e:?}");
-                } else {
-                    return Err(e);
+            // Collapse any queued signals into this one run.
+            while run_rx.try_recv().is_ok() {}
+
+            let mut retried = false;
+            loop {
+                if conn.close_reason().is_some() {
+                    tracing::warn!("Connection closed, reconnecting...");
+                    conn = connect_with_retry(&ep_task, &ticket, max_attempts).await?;
+                }
+
+                match run_once(&conn, root_clone.clone()).await {
+                    Ok(()) => break,
+                    // Connection died mid-sync: reconnect and retry the run once.
+                    Err(e) if conn.close_reason().is_some() && !retried => {
+                        tracing::warn!("Sync interrupted by connection loss: {e:?}");
+                        retried = true;
+                    }
+                    Err(e) if keep_open => {
+                        tracing::error!("Sync failed: {e:?}");
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -178,7 +213,38 @@ async fn handle_send(
         runner.await??;
     }
 
+    // Close gracefully so in-flight data is flushed.
+    ep.close().await;
+
     Ok(())
+}
+
+/// Connects to the receiver, retrying with exponential backoff (1s up to 30s).
+/// `max_attempts = None` retries forever.
+async fn connect_with_retry(
+    ep: &iroh::Endpoint,
+    ticket: &iroh_tickets::endpoint::EndpointTicket,
+    max_attempts: Option<u32>,
+) -> eyre::Result<iroh::endpoint::Connection> {
+    let mut attempt = 0u32;
+    let mut delay = std::time::Duration::from_secs(1);
+
+    loop {
+        attempt += 1;
+        match ep.connect(ticket.clone(), patchsync::ALPN).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if max_attempts.is_some_and(|max| attempt >= max) {
+                    return Err(eyre::eyre!(
+                        "Failed to connect after {attempt} attempts: {e}"
+                    ));
+                }
+                tracing::warn!("Connect attempt {attempt} failed: {e}; retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 /// Performs a single sync run over a fresh bi-directional stream,
