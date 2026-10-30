@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     dirwalker::PathEntry,
+    event::EventSink,
     snapshot::{PathKey, SnapshotEntry},
 };
 
@@ -79,16 +80,16 @@ impl<T, R, P> EventStreamHandler<T, R, P>
 where
     T: Serialize,
     R: DeserializeOwned,
-    P: FromProgress + Clone,
+    P: FromProgress,
 {
-    pub fn new(
+    pub(crate) fn new(
         send: iroh::endpoint::SendStream,
         recv: iroh::endpoint::RecvStream,
-        tracker_tx: flume::Sender<P>,
+        sink: EventSink<P>,
     ) -> Self {
         Self {
-            send: TrackedStream::new(send, tracker_tx.clone()),
-            recv: TrackedStream::new(recv, tracker_tx),
+            send: TrackedStream::new(send, sink.clone()),
+            recv: TrackedStream::new(recv, sink),
             _t: std::marker::PhantomData,
             _r: std::marker::PhantomData,
         }
@@ -118,7 +119,7 @@ async fn send_msg<T, R, P>(stream: &mut TrackedStream<R, P>, msg: &T) -> crate::
 where
     T: Serialize,
     R: tokio::io::AsyncWrite + Unpin,
-    P: FromProgress + Clone,
+    P: FromProgress,
 {
     let payload = postcard::to_stdvec(msg)?;
     let len = payload.len() as u32;
@@ -132,7 +133,7 @@ async fn recv_msg<T, R, P>(stream: &mut TrackedStream<R, P>) -> crate::Result<T>
 where
     T: DeserializeOwned,
     R: tokio::io::AsyncRead + Unpin,
-    P: FromProgress + Clone,
+    P: FromProgress,
 {
     let mut len_buf = [0u8; 4];
     stream.read_exact_tracked(&mut len_buf).await?;
@@ -146,12 +147,12 @@ where
 
 pub struct TrackedStream<S, E> {
     inner: S,
-    tx: flume::Sender<E>,
+    sink: EventSink<E>,
 }
 
 impl<S, E> TrackedStream<S, E> {
-    pub fn new(inner: S, tx: flume::Sender<E>) -> Self {
-        Self { inner, tx }
+    pub(crate) fn new(inner: S, sink: EventSink<E>) -> Self {
+        Self { inner, sink }
     }
 }
 
@@ -174,9 +175,7 @@ where
             sent += n;
             tracing::trace!(bytes = n, "Stream wrote bytes");
 
-            if let Err(e) = self.tx.send_async(E::from_bytes(n)).await {
-                tracing::warn!("Failed to send progress event to channel: {e}");
-            }
+            self.sink.progress(n);
         }
 
         Ok(())
@@ -201,9 +200,7 @@ where
             received += n;
             tracing::trace!(bytes = n, "Stream read bytes");
 
-            if let Err(e) = self.tx.send_async(E::from_bytes(n)).await {
-                tracing::warn!("Failed to send progress event to channel: {e}");
-            }
+            self.sink.progress(n);
         }
 
         Ok(())
@@ -213,6 +210,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::duplex;
 
     #[test]
@@ -234,11 +232,20 @@ mod tests {
     async fn test_tracked_stream_and_msg_roundtrip() -> crate::Result<()> {
         let (client_io, server_io) = duplex(1024);
 
-        let (tx_send, rx_send) = flume::unbounded::<SendEvent>();
-        let (tx_recv, rx_recv) = flume::unbounded::<RecvEvent>();
+        let client_events = Arc::new(Mutex::new(Vec::new()));
+        let client_events_c = Arc::clone(&client_events);
+        let client_dispatcher = crate::event::Dispatcher::spawn(move |e: SendEvent| {
+            client_events_c.lock().unwrap().push(e);
+        });
 
-        let mut client_stream = TrackedStream::new(client_io, tx_send);
-        let mut server_stream = TrackedStream::new(server_io, tx_recv);
+        let server_events = Arc::new(Mutex::new(Vec::new()));
+        let server_events_c = Arc::clone(&server_events);
+        let server_dispatcher = crate::event::Dispatcher::spawn(move |e: RecvEvent| {
+            server_events_c.lock().unwrap().push(e);
+        });
+
+        let mut client_stream = TrackedStream::new(client_io, client_dispatcher.sink());
+        let mut server_stream = TrackedStream::new(server_io, server_dispatcher.sink());
 
         let sent_msg = SenderToReceiver::RequestSnapshot;
 
@@ -253,11 +260,26 @@ mod tests {
             _ => panic!("Expected RequestSnapshot"),
         }
 
+        tokio::task::spawn_blocking(move || client_dispatcher.shutdown())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || server_dispatcher.shutdown())
+            .await
+            .unwrap();
+
         // Verify progress events emitted
-        let send_progress: Vec<_> = rx_send.drain().collect();
-        let recv_progress: Vec<_> = rx_recv.drain().collect();
-        assert!(!send_progress.is_empty());
-        assert!(!recv_progress.is_empty());
+        let send_recorded = client_events.lock().unwrap();
+        let recv_recorded = server_events.lock().unwrap();
+        assert!(
+            send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::Progress { .. }))
+        );
+        assert!(
+            recv_recorded
+                .iter()
+                .any(|e| matches!(e, RecvEvent::Progress { .. }))
+        );
 
         Ok(())
     }
@@ -265,11 +287,11 @@ mod tests {
     #[tokio::test]
     async fn test_tracked_stream_read_write_closed() -> crate::Result<()> {
         let (client_io, server_io) = duplex(1024);
-        let (tx1, _rx1) = flume::unbounded::<SendEvent>();
-        let (tx2, _rx2) = flume::unbounded::<RecvEvent>();
+        let client_dispatcher = crate::event::Dispatcher::spawn(|_: SendEvent| {});
+        let server_dispatcher = crate::event::Dispatcher::spawn(|_: RecvEvent| {});
 
-        let mut client_stream = TrackedStream::new(client_io, tx1);
-        let server_stream = TrackedStream::new(server_io, tx2);
+        let mut client_stream = TrackedStream::new(client_io, client_dispatcher.sink());
+        let server_stream = TrackedStream::new(server_io, server_dispatcher.sink());
 
         // Close server side
         drop(server_stream);
@@ -277,6 +299,13 @@ mod tests {
         // Writing or reading should fail
         let mut buf = [0u8; 10];
         assert!(client_stream.read_exact_tracked(&mut buf).await.is_err());
+
+        tokio::task::spawn_blocking(move || client_dispatcher.shutdown())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || server_dispatcher.shutdown())
+            .await
+            .unwrap();
 
         Ok(())
     }
