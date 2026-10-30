@@ -28,3 +28,5 @@ indicatif.workspace = true
 iroh-tickets.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
+notify = { version = "8.2.1", features = ["flume"] }
+notify-debouncer-full = { version = "0.7.0", features = ["flume"] }
