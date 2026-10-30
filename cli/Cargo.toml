@@ -1,8 +1,11 @@
 [package]
 name = "patchsync-cli"
 version = "0.1.0"
-authors = ["Robin Mauritz <robin@mdev.co.id>"]
+authors = ["Robin Mauritz <robinmauritzrm@gmail.com>"]
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RoganMatrivski/patchsync"
+description = "CLI for patchsync, an rsync-like file syncing tool over iroh."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -25,4 +28,3 @@ indicatif.workspace = true
 iroh-tickets.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
-
