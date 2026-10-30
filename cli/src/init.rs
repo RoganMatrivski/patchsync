@@ -9,6 +9,8 @@ pub struct Args {
     pub verbose: u8,
 
     /// Keep open after transferring.
+    /// On receive, this will keep accept incoming transfer.
+    /// On send, this will watch the directory for new files to send.
     #[arg(short, long)]
     pub keep_open: bool,
 
