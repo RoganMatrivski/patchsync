@@ -9,23 +9,39 @@ mod init;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+struct AppConfig {
+    root: std::path::PathBuf,
+    keep_open: bool,
+}
+
+impl init::Args {
+    pub fn split_appcfg_and_command(self) -> (AppConfig, init::Command) {
+        (
+            AppConfig {
+                root: self.root_dir,
+                keep_open: self.keep_open,
+            },
+            self.command,
+        )
+    }
+}
+
 #[tracing::instrument]
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     let args = init::initialize()?;
-    println!("Hello, world!");
 
-    let root = args.root_dir;
+    let (appcfg, command) = args.split_appcfg_and_command();
 
-    match args.command {
-        init::Command::Send { ticket } => handle_send(root, ticket).await?,
-        init::Command::Receive => handle_recv(root).await?,
+    match command {
+        init::Command::Send { ticket } => handle_send(appcfg, ticket).await?,
+        init::Command::Receive => handle_recv(appcfg).await?,
     }
 
     Ok(())
 }
 
-async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
+async fn handle_recv(AppConfig { root, keep_open }: AppConfig) -> eyre::Result<()> {
     // TODO: Set key to project data dir
     let key_path = root.join(".patchsync_key");
     let key = if key_path.exists() {
@@ -65,11 +81,15 @@ async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
                 match ev {
                     patchsync::sync::RecvEvent::Finished => {
                         println!("Sync completed successfully.");
-                        break;
+                        if !keep_open {
+                            break;
+                        }
                     }
                     patchsync::sync::RecvEvent::Error(err) => {
                         eprintln!("Sync failed: {err}");
-                        break;
+                        if !keep_open {
+                            break;
+                        }
                     }
                     ev => {
                         // Handle progress or other events if desired
@@ -89,7 +109,7 @@ async fn handle_recv(root: std::path::PathBuf) -> eyre::Result<()> {
 }
 
 async fn handle_send(
-    root: std::path::PathBuf,
+    AppConfig { root, keep_open }: AppConfig,
     ticket: iroh_tickets::endpoint::EndpointTicket,
 ) -> eyre::Result<()> {
     let ep = iroh::Endpoint::builder(presets::N0).bind().await?;

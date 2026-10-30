@@ -8,10 +8,14 @@ pub struct Args {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    #[command(subcommand)]
-    pub command: Command,
+    /// Keep open after transferring.
+    #[arg(short, long)]
+    pub keep_open: bool,
 
     pub root_dir: std::path::PathBuf,
+
+    #[command(subcommand)]
+    pub command: Command,
 }
 
 #[derive(clap::Subcommand)]
