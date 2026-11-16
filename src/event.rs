@@ -25,6 +25,7 @@ impl<E, H: EventHandler<E> + ?Sized> EventHandler<E> for Arc<H> {
 #[allow(dead_code)]
 pub(crate) enum Msg<E> {
     Event(E),
+    EventWithAck(E, tokio::sync::oneshot::Sender<bool>),
     ProgressWake,
     Shutdown,
 }
@@ -47,6 +48,14 @@ impl<E> Clone for EventSink<E> {
 impl<E> EventSink<E> {
     pub(crate) fn emit(&self, e: E) {
         let _ = self.sender.send(e_to_msg(e));
+    }
+
+    pub(crate) async fn emit_and_wait(&self, e: E) -> bool {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if self.sender.send(Msg::EventWithAck(e, ack)).is_err() {
+            return false;
+        }
+        done.await.unwrap_or(false)
     }
 
     pub(crate) fn progress(&self, bytes: usize) {
@@ -95,6 +104,18 @@ impl<E: FromProgress + Send + 'static> Dispatcher<E> {
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 handler.handle(e);
                             }));
+                        }
+                        Msg::EventWithAck(e, ack) => {
+                            flush(&handler, &pending_bytes_clone);
+                            let handled =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handler.handle(e);
+                                }))
+                                .is_ok();
+                            if !handled {
+                                tracing::error!("Event handler panicked during awaited event");
+                            }
+                            let _ = ack.send(handled);
                         }
                         Msg::ProgressWake => {
                             flush(&handler, &pending_bytes_clone);
@@ -237,6 +258,39 @@ mod tests {
             _ => panic!("expected progress first"),
         }
         assert_eq!(recorded[1], TestEvent::Lifecycle(1));
+    }
+
+    #[tokio::test]
+    async fn test_emit_and_wait_waits_for_handler() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let dispatcher = Dispatcher::spawn(move |e: TestEvent| {
+            if e == TestEvent::Lifecycle(1) {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+
+        let sink = dispatcher.sink();
+        let waiting =
+            tokio::spawn(async move { sink.emit_and_wait(TestEvent::Lifecycle(1)).await });
+        tokio::task::yield_now().await;
+        started_rx.recv().unwrap();
+        assert!(!waiting.is_finished());
+
+        release_tx.send(()).unwrap();
+        assert!(waiting.await.unwrap());
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_emit_and_wait_reports_handler_panic() {
+        let dispatcher = Dispatcher::spawn(|_: TestEvent| panic!("boom"));
+        let sink = dispatcher.sink();
+
+        assert!(!sink.emit_and_wait(TestEvent::Lifecycle(1)).await);
+        dispatcher.shutdown();
     }
 
     #[test]

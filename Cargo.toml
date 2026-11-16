@@ -47,7 +47,7 @@ description = "Sync a directory (or a file), rsync-like, with iroh."
 # Shared
 flume.workspace = true
 iroh.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync"] }
 tracing.workspace = true
 
 # Library only

@@ -116,7 +116,14 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     SenderToReceiver::SendPatch(items) => {
                         tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
-                        sink.emit(RecvEvent::EntryPreApply);
+                        if !sink.emit_and_wait(RecvEvent::EntryPreApply).await {
+                            let err_msg =
+                                "Pre-apply event handler did not complete successfully".to_string();
+                            tracing::error!("{err_msg}");
+                            sink.emit(RecvEvent::Error(err_msg.clone()));
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        }
 
                         let mut apply_failed = false;
                         for item in items {
