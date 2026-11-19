@@ -56,9 +56,6 @@ pub enum Error {
 
     #[error("Path parent not found for {0}")]
     NoParentDir(PathBuf),
-
-    #[error("Failed to persist temp file: {0}")]
-    Persist(#[from] tempfile::PersistError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

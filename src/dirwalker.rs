@@ -1,5 +1,10 @@
-use std::{path::PathBuf, thread};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+};
 
+use cap_std::fs::Dir;
 use ignore::{ParallelVisitor, ParallelVisitorBuilder};
 
 use crate::chunker::FileChunk;
@@ -33,6 +38,33 @@ impl PathEntry {
 
 struct FileVisitor {
     tx: flume::Sender<PathEntry>,
+    root: PathBuf,
+    cap_root: Option<Arc<Dir>>,
+}
+
+impl FileVisitor {
+    fn verify_dir(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(root) = &self.cap_root {
+            let relative = path
+                .strip_prefix(&self.root)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            if !relative.as_os_str().is_empty() {
+                root.open_dir(relative)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if let Some(root) = &self.cap_root {
+            let relative = path
+                .strip_prefix(&self.root)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            root.open(relative).map(cap_std::fs::File::into_std)
+        } else {
+            std::fs::File::open(path)
+        }
+    }
 }
 
 impl ParallelVisitor for FileVisitor {
@@ -47,7 +79,20 @@ impl ParallelVisitor for FileVisitor {
                     }
                 };
 
+                if self.cap_root.is_some() && file_type.is_symlink() {
+                    tracing::debug!(path = %e.path().display(), "Skipping symlink in receiver snapshot");
+                    return ignore::WalkState::Continue;
+                }
+
                 if file_type.is_dir() {
+                    if let Err(err) = self.verify_dir(e.path()) {
+                        tracing::warn!(
+                            path = %e.path().display(),
+                            ?err,
+                            "Failed to open directory within receiver root"
+                        );
+                        return ignore::WalkState::Continue;
+                    }
                     if let Err(err) = self.tx.send(PathEntry::Dir {
                         path: e.into_path(),
                     }) {
@@ -60,7 +105,11 @@ impl ParallelVisitor for FileVisitor {
                         ignore::WalkState::Continue
                     }
                 } else {
-                    let file = match std::fs::File::open(e.path()) {
+                    if !file_type.is_file() {
+                        return ignore::WalkState::Continue;
+                    }
+
+                    let file = match self.open_file(e.path()) {
                         Ok(f) => f,
                         Err(err) => {
                             tracing::error!(
@@ -135,18 +184,32 @@ impl ParallelVisitor for FileVisitor {
 
 struct FileVisitorBuilder {
     tx: flume::Sender<PathEntry>,
+    root: PathBuf,
+    cap_root: Option<Arc<Dir>>,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for FileVisitorBuilder {
     fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
         Box::new(FileVisitor {
             tx: self.tx.clone(),
+            root: self.root.clone(),
+            cap_root: self.cap_root.clone(),
         })
     }
 }
 
 pub fn walkdir(dir: impl Into<PathBuf>) -> crate::Result<Vec<PathEntry>> {
-    let dir = dir.into();
+    walkdir_inner(dir.into(), None)
+}
+
+pub(crate) fn walkdir_cap(
+    dir: Arc<Dir>,
+    display_root: impl Into<PathBuf>,
+) -> crate::Result<Vec<PathEntry>> {
+    walkdir_inner(display_root.into(), Some(dir))
+}
+
+fn walkdir_inner(dir: PathBuf, cap_root: Option<Arc<Dir>>) -> crate::Result<Vec<PathEntry>> {
     if !dir.exists() {
         tracing::error!(path = %dir.display(), "Directory does not exist for walkdir");
         return Err(crate::Error::RootDoesNotExist(dir));
@@ -156,7 +219,11 @@ pub fn walkdir(dir: impl Into<PathBuf>) -> crate::Result<Vec<PathEntry>> {
 
     let walk_dir = dir.clone();
     thread::spawn(move || {
-        let mut builder = FileVisitorBuilder { tx };
+        let mut builder = FileVisitorBuilder {
+            tx,
+            root: walk_dir.clone(),
+            cap_root,
+        };
         ignore::WalkBuilder::new(walk_dir)
             .git_ignore(false)
             .build_parallel()
@@ -213,6 +280,29 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_walkdir_cap_skips_symlink_files() -> crate::Result<()> {
+        use cap_std::ambient_authority;
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "must not be read")?;
+        symlink(&outside_file, root.path().join("link.txt"))?;
+
+        let cap_root = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+        let entries = walkdir_cap(&cap_root, root.path())?;
+
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.into_path().ends_with("link.txt"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_walkdir_nested_structure() -> crate::Result<()> {
         let dir = tempdir()?;
@@ -262,4 +352,3 @@ mod tests {
         assert!(res.is_err());
     }
 }
-

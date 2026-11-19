@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
@@ -7,6 +7,7 @@ use crate::{
     snapshot::PathKey,
     sync::{EventStreamHandler, ReceiverToSender, RecvEvent, SendEvent, SenderToReceiver},
 };
+use cap_std::{ambient_authority, fs::Dir};
 
 pub mod chunker;
 pub mod dirwalker;
@@ -64,7 +65,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     sink.clone(),
                 );
 
-            let mut destination = self.root.clone();
+            let mut destination: Option<Arc<Dir>> = None;
             loop {
                 let msg = match ev_handler.recv().await {
                     Ok(msg) => msg,
@@ -78,7 +79,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 match msg {
                     SenderToReceiver::RequestSnapshot { subpath } => {
                         tracing::trace!("Received RequestSnapshot from sender");
-                        let target = match resolve_destination(&self.root, &subpath) {
+                        let relative = match resolve_destination(&subpath) {
                             Ok(path) => path,
                             Err(e) => {
                                 let err_msg = format!("Invalid destination subpath: {e}");
@@ -89,10 +90,10 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             }
                         };
 
-                        if let Err(e) = std::fs::create_dir_all(&target) {
+                        if let Err(e) = std::fs::create_dir_all(&self.root) {
                             let err_msg = format!(
-                                "Failed to create destination directory {}: {e}",
-                                target.display()
+                                "Failed to create receiver root {}: {e}",
+                                self.root.display()
                             );
                             tracing::error!("{err_msg}");
                             sink.emit(RecvEvent::Error(err_msg.clone()));
@@ -100,8 +101,57 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             break;
                         }
 
-                        destination = target;
-                        let old_snapshot = match crate::dirwalker::walkdir(&destination) {
+                        let root_dir =
+                            match Dir::open_ambient_dir(&self.root, ambient_authority()) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    let err_msg = format!(
+                                        "Failed to open receiver root {}: {e}",
+                                        self.root.display()
+                                    );
+                                    tracing::error!("{err_msg}");
+                                    sink.emit(RecvEvent::Error(err_msg.clone()));
+                                    let _ =
+                                        ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                    break;
+                                }
+                            };
+                        let target_dir = if relative.as_os_str().is_empty() {
+                            root_dir
+                        } else {
+                            if let Err(e) = root_dir.create_dir_all(&relative) {
+                                let err_msg = format!(
+                                    "Failed to create destination directory {}: {e}",
+                                    relative.display()
+                                );
+                                tracing::error!("{err_msg}");
+                                sink.emit(RecvEvent::Error(err_msg.clone()));
+                                let _ =
+                                    ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                break;
+                            }
+                            match root_dir.open_dir(&relative) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    let err_msg = format!(
+                                        "Failed to open destination directory {}: {e}",
+                                        relative.display()
+                                    );
+                                    tracing::error!("{err_msg}");
+                                    sink.emit(RecvEvent::Error(err_msg.clone()));
+                                    let _ =
+                                        ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                    break;
+                                }
+                            }
+                        };
+                        let target_dir = Arc::new(target_dir);
+
+                        let destination_path = self.root.join(&relative);
+                        let old_snapshot = match crate::dirwalker::walkdir_cap(
+                            Arc::clone(&target_dir),
+                            &destination_path,
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
                                 let err_msg = format!("Failed to walk root directory: {e}");
@@ -112,9 +162,12 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             }
                         };
 
+                        destination = Some(target_dir);
                         let old = match old_snapshot
                             .into_iter()
-                            .map(|x| PathKey::from_pathentry(&destination, &x).map(|k| (k, x)))
+                            .map(|x| {
+                                PathKey::from_pathentry(&destination_path, &x).map(|k| (k, x))
+                            })
                             .collect::<Result<HashMap<_, _>, crate::Error>>()
                         {
                             Ok(map) => map,
@@ -141,6 +194,16 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     SenderToReceiver::SendPatch(items) => {
                         tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
+                        let Some(destination) = destination.as_ref() else {
+                            let err_msg =
+                                "Received patches before requesting a destination snapshot"
+                                    .to_string();
+                            tracing::error!("{err_msg}");
+                            sink.emit(RecvEvent::Error(err_msg.clone()));
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        };
+
                         if !sink.emit_and_wait(RecvEvent::EntryPreApply).await {
                             let err_msg =
                                 "Pre-apply event handler did not complete successfully".to_string();
@@ -157,7 +220,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                             sink.emit(RecvEvent::EntryReceiving { path: path.clone() });
 
-                            if let Err(e) = item.apply(&destination) {
+                            if let Err(e) = item.apply_in(destination) {
                                 let err_msg =
                                     format!("Failed to apply patch entry for {}: {e}", path.display());
                                 tracing::error!("{err_msg}");
@@ -357,12 +420,12 @@ impl SendHandler {
     }
 }
 
-fn resolve_destination(root: &Path, subpath: &str) -> crate::Result<PathBuf> {
+fn resolve_destination(subpath: &str) -> crate::Result<PathBuf> {
     if subpath.starts_with(['/', '\\']) {
         return Err(crate::Error::InvalidRelativePath(PathBuf::from(subpath)));
     }
 
-    let mut destination = root.to_path_buf();
+    let mut destination = PathBuf::new();
     for component in subpath.split(['/', '\\']) {
         if component.is_empty() {
             continue;
@@ -386,14 +449,28 @@ mod tests {
 
     #[test]
     fn test_resolve_destination() {
-        let root = Path::new(r"C:\sync");
         assert_eq!(
-            resolve_destination(root, r"subdir\").unwrap(),
-            root.join("subdir")
+            resolve_destination(r"subdir\").unwrap(),
+            PathBuf::from("subdir")
         );
-        assert!(resolve_destination(root, r"..\outside").is_err());
-        assert!(resolve_destination(root, r"C:\outside").is_err());
-        assert!(resolve_destination(root, r"\outside").is_err());
+        assert!(resolve_destination(r"..\outside").is_err());
+        assert!(resolve_destination(r"C:\outside").is_err());
+        assert!(resolve_destination(r"\outside").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_destination_rejects_symlink_escape() -> crate::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        symlink(outside.path(), root.path().join("link"))?;
+
+        let root_dir = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+        assert!(root_dir.create_dir_all("link/nested").is_err());
+        assert!(!outside.path().join("nested").exists());
+        Ok(())
     }
 
     #[tokio::test]

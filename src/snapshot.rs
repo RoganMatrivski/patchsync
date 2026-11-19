@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 
 use crate::dirwalker::PathEntry;
@@ -112,23 +113,30 @@ impl SnapshotEntry {
     }
 
     pub fn apply(self, root: impl AsRef<Path>) -> crate::Result<()> {
-        if !root.as_ref().exists() {
-            return Err(crate::Error::RootDoesNotExist(
-                root.as_ref().to_path_buf(),
-            ));
+        let root = root.as_ref();
+        if !root.exists() {
+            return Err(crate::Error::RootDoesNotExist(root.to_path_buf()));
         }
 
+        let root = Dir::open_ambient_dir(root, ambient_authority())?;
+        self.apply_in(&root)
+    }
+
+    pub(crate) fn apply_in(self, root: &Dir) -> crate::Result<()> {
         match self {
             SnapshotEntry::Create { path, bytes } => {
-                let p = safe_join(root.as_ref(), &path)?;
-                if let Some(pdir) = p.parent() {
-                    std::fs::create_dir_all(&pdir)?;
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    root.create_dir_all(parent)?;
                 }
-                std::fs::write(p, bytes)?;
+                root.create(&path)?.write_all(&bytes)?;
             }
             SnapshotEntry::Update { path, instructs } => {
-                let p = safe_join(root.as_ref(), &path)?;
-                let file = std::fs::File::open(&p)?;
+                let file = root.open(&path)?;
+                let permissions = file.metadata()?.permissions();
+                let file = file.into_std();
 
                 // TODO: TODO: Replace with seek read.
                 // TODO: Add feature flag to disable memmap2
@@ -163,44 +171,39 @@ impl SnapshotEntry {
                 drop(filebin);
                 drop(file);
 
-                let parent = p
-                    .parent()
-                    .ok_or_else(|| crate::Error::NoParentDir(p.clone()))?;
-                let mut tempfile = tempfile::NamedTempFile::new_in(parent)?;
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let parent_dir = root.open_dir(parent)?;
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| crate::Error::InvalidRelativePath(path.clone()))?;
+                let mut tempfile = cap_tempfile::TempFile::new(&parent_dir)?;
 
                 tempfile.write_all(&newfilebin)?;
-                tempfile.persist(p)?;
+                tempfile.as_file().set_permissions(permissions)?;
+                tempfile.replace(name)?;
             }
             SnapshotEntry::Delete { path } => {
                 if path.as_os_str().is_empty() {
                     return Ok(());
                 }
-                let p = safe_join(root.as_ref(), &path)?;
-                if p.is_dir() {
-                    std::fs::remove_dir_all(&p)?;
-                } else {
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
+                match root.symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        root.remove_dir_all(&path)?;
                     }
+                    Ok(_) => root.remove_file(&path)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
                 }
             }
         }
 
         Ok(())
     }
-}
-
-fn safe_join(root: &Path, path: &Path) -> crate::Result<PathBuf> {
-    let mut destination = root.to_path_buf();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => destination.push(part),
-            _ => return Err(crate::Error::InvalidRelativePath(path.to_path_buf())),
-        }
-    }
-    Ok(destination)
 }
 
 pub fn diff<K1, K2>(
@@ -415,6 +418,31 @@ mod tests {
 
         assert!(entry.apply(&root).is_err());
         assert!(!outside.exists());
+
+        let absolute = SnapshotEntry::Create {
+            path: outside.clone(),
+            bytes: b"must not be written".to_vec(),
+        };
+        assert!(absolute.apply(&root).is_err());
+        assert!(!outside.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_rejects_symlink_escape() -> crate::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        symlink(outside.path(), root.path().join("link"))?;
+
+        let entry = SnapshotEntry::Create {
+            path: PathBuf::from("link/escaped.txt"),
+            bytes: b"must not be written".to_vec(),
+        };
+        assert!(entry.apply(root.path()).is_err());
+        assert!(!outside.path().join("escaped.txt").exists());
         Ok(())
     }
 
@@ -456,6 +484,29 @@ mod tests {
         };
         update.apply(dir.path())?;
         assert_eq!(std::fs::read_to_string(file_path)?, "ABCDE123UVWXYZ");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_update_preserves_permissions() -> crate::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir()?;
+        let file_path = dir.path().join("file.txt");
+        std::fs::write(&file_path, "old content")?;
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o640))?;
+
+        let update = SnapshotEntry::Update {
+            path: PathBuf::from("file.txt"),
+            instructs: vec![PatchInstructs::Literal {
+                data: b"new content".to_vec(),
+            }],
+        };
+        update.apply(dir.path())?;
+
+        assert_eq!(std::fs::read_to_string(&file_path)?, "new content");
+        assert_eq!(std::fs::metadata(file_path)?.mode() & 0o777, 0o640);
         Ok(())
     }
 
