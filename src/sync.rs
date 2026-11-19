@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(Serialize, Deserialize)]
 pub enum SenderToReceiver {
-    RequestSnapshot,
+    RequestSnapshot { subpath: String },
     SendPatch(Vec<SnapshotEntry>),
     Ack,
 }
@@ -247,7 +247,9 @@ mod tests {
         let mut client_stream = TrackedStream::new(client_io, client_dispatcher.sink());
         let mut server_stream = TrackedStream::new(server_io, server_dispatcher.sink());
 
-        let sent_msg = SenderToReceiver::RequestSnapshot;
+        let sent_msg = SenderToReceiver::RequestSnapshot {
+            subpath: String::new(),
+        };
 
         // Send msg from client to server
         tokio::spawn(async move {
@@ -256,7 +258,9 @@ mod tests {
 
         let recv_msg: SenderToReceiver = recv_msg(&mut server_stream).await?;
         match recv_msg {
-            SenderToReceiver::RequestSnapshot => {}
+            SenderToReceiver::RequestSnapshot { subpath } => {
+                assert!(subpath.is_empty());
+            }
             _ => panic!("Expected RequestSnapshot"),
         }
 

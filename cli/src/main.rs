@@ -33,7 +33,7 @@ async fn main() -> Result<(), Report> {
     let (appcfg, command) = args.split_appcfg_and_command();
 
     match command {
-        init::Command::Send { ticket } => handle_send(appcfg, ticket).await?,
+        init::Command::Send { ticket, subpath } => handle_send(appcfg, ticket, subpath).await?,
         init::Command::Receive => handle_recv(appcfg).await?,
     }
 
@@ -113,6 +113,7 @@ async fn handle_recv(AppConfig { root, keep_open }: AppConfig) -> eyre::Result<(
 async fn handle_send(
     AppConfig { root, keep_open }: AppConfig,
     ticket: iroh_tickets::endpoint::EndpointTicket,
+    subpath: String,
 ) -> eyre::Result<()> {
     // Keep-alives stop idle timeouts from killing the connection between syncs,
     // and a generous idle timeout lets it ride out short network drops.
@@ -137,6 +138,7 @@ async fn handle_send(
     let (run_tx, run_rx) = flume::unbounded::<()>();
 
     let root_clone = root.clone();
+    let subpath_clone = subpath.clone();
     let ep_task = ep.clone();
     let mut runner = tokio::spawn(async move {
         while run_rx.recv_async().await.is_ok() {
@@ -150,7 +152,7 @@ async fn handle_send(
                     conn = connect_with_retry(&ep_task, &ticket, max_attempts).await?;
                 }
 
-                match run_once(&conn, root_clone.clone()).await {
+                match run_once(&conn, root_clone.clone(), subpath_clone.clone()).await {
                     Ok(()) => break,
                     // Connection died mid-sync: reconnect and retry the run once.
                     Err(e) if conn.close_reason().is_some() && !retried => {
@@ -249,10 +251,14 @@ async fn connect_with_retry(
 
 /// Performs a single sync run over a fresh bi-directional stream,
 /// with its own event channel and progress bar.
-async fn run_once(conn: &iroh::endpoint::Connection, root: std::path::PathBuf) -> eyre::Result<()> {
+async fn run_once(
+    conn: &iroh::endpoint::Connection,
+    root: std::path::PathBuf,
+    subpath: String,
+) -> eyre::Result<()> {
     let (evtx, evrx) = flume::unbounded();
     let (tx, rx) = conn.open_bi().await?;
-    let handler = patchsync::SendHandler::new(tx, rx, root).await?;
+    let handler = patchsync::SendHandler::new(tx, rx, root, subpath).await?;
 
     let pb = indicatif::ProgressBar::new_spinner();
     pb.enable_steady_tick(std::time::Duration::from_millis(100));

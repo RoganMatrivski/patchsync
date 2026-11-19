@@ -120,14 +120,14 @@ impl SnapshotEntry {
 
         match self {
             SnapshotEntry::Create { path, bytes } => {
-                let p = root.as_ref().join(path);
+                let p = safe_join(root.as_ref(), &path)?;
                 if let Some(pdir) = p.parent() {
                     std::fs::create_dir_all(&pdir)?;
                 }
                 std::fs::write(p, bytes)?;
             }
             SnapshotEntry::Update { path, instructs } => {
-                let p = root.as_ref().join(path);
+                let p = safe_join(root.as_ref(), &path)?;
                 let file = std::fs::File::open(&p)?;
 
                 // TODO: TODO: Replace with seek read.
@@ -175,7 +175,7 @@ impl SnapshotEntry {
                 if path.as_os_str().is_empty() {
                     return Ok(());
                 }
-                let p = root.as_ref().join(path);
+                let p = safe_join(root.as_ref(), &path)?;
                 if p.is_dir() {
                     std::fs::remove_dir_all(&p)?;
                 } else {
@@ -190,6 +190,17 @@ impl SnapshotEntry {
 
         Ok(())
     }
+}
+
+fn safe_join(root: &Path, path: &Path) -> crate::Result<PathBuf> {
+    let mut destination = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => destination.push(part),
+            _ => return Err(crate::Error::InvalidRelativePath(path.to_path_buf())),
+        }
+    }
+    Ok(destination)
 }
 
 pub fn diff<K1, K2>(
@@ -389,6 +400,22 @@ mod tests {
             path: PathBuf::from("foo"),
         };
         assert!(entry.apply("/non/existent/path/for/sure").is_err());
+    }
+
+    #[test]
+    fn test_apply_rejects_path_outside_root() -> crate::Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root)?;
+        let outside = dir.path().join("outside");
+        let entry = SnapshotEntry::Create {
+            path: PathBuf::from("../outside"),
+            bytes: b"must not be written".to_vec(),
+        };
+
+        assert!(entry.apply(&root).is_err());
+        assert!(!outside.exists());
+        Ok(())
     }
 
     #[test]

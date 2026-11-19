@@ -32,6 +32,9 @@ pub enum Error {
     #[error("Root directory does not exist: {0}")]
     RootDoesNotExist(PathBuf),
 
+    #[error("Path must be relative and cannot escape its root: {0}")]
+    InvalidRelativePath(PathBuf),
+
     #[error("Copy instruction bounds error: file len {file_len}, requested range {start}..{end}")]
     CopyInstructionOutOfBounds {
         file_len: usize,

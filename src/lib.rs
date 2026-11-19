@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -17,7 +18,7 @@ pub mod sync;
 pub use error::{Error, Result};
 pub use event::EventHandler;
 
-pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/0/";
+pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/1/";
 
 #[derive(Clone)]
 pub struct RecvProtocol {
@@ -63,6 +64,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     sink.clone(),
                 );
 
+            let mut destination = self.root.clone();
             loop {
                 let msg = match ev_handler.recv().await {
                     Ok(msg) => msg,
@@ -74,9 +76,32 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                 };
 
                 match msg {
-                    SenderToReceiver::RequestSnapshot => {
+                    SenderToReceiver::RequestSnapshot { subpath } => {
                         tracing::trace!("Received RequestSnapshot from sender");
-                        let old_snapshot = match crate::dirwalker::walkdir(&self.root) {
+                        let target = match resolve_destination(&self.root, &subpath) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                let err_msg = format!("Invalid destination subpath: {e}");
+                                tracing::error!("{err_msg}");
+                                sink.emit(RecvEvent::Error(err_msg.clone()));
+                                let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                                break;
+                            }
+                        };
+
+                        if let Err(e) = std::fs::create_dir_all(&target) {
+                            let err_msg = format!(
+                                "Failed to create destination directory {}: {e}",
+                                target.display()
+                            );
+                            tracing::error!("{err_msg}");
+                            sink.emit(RecvEvent::Error(err_msg.clone()));
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        }
+
+                        destination = target;
+                        let old_snapshot = match crate::dirwalker::walkdir(&destination) {
                             Ok(s) => s,
                             Err(e) => {
                                 let err_msg = format!("Failed to walk root directory: {e}");
@@ -89,7 +114,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                         let old = match old_snapshot
                             .into_iter()
-                            .map(|x| PathKey::from_pathentry(&self.root, &x).map(|k| (k, x)))
+                            .map(|x| PathKey::from_pathentry(&destination, &x).map(|k| (k, x)))
                             .collect::<Result<HashMap<_, _>, crate::Error>>()
                         {
                             Ok(map) => map,
@@ -132,7 +157,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                             sink.emit(RecvEvent::EntryReceiving { path: path.clone() });
 
-                            if let Err(e) = item.apply(&self.root) {
+                            if let Err(e) = item.apply(&destination) {
                                 let err_msg =
                                     format!("Failed to apply patch entry for {}: {e}", path.display());
                                 tracing::error!("{err_msg}");
@@ -200,6 +225,7 @@ pub struct SendHandler {
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     root: std::path::PathBuf,
+    subpath: String,
 }
 
 impl SendHandler {
@@ -207,8 +233,14 @@ impl SendHandler {
         send: iroh::endpoint::SendStream,
         recv: iroh::endpoint::RecvStream,
         root: std::path::PathBuf,
+        subpath: String,
     ) -> crate::Result<Self> {
-        Ok(Self { send, recv, root })
+        Ok(Self {
+            send,
+            recv,
+            root,
+            subpath,
+        })
     }
 
     pub async fn send_loop(self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
@@ -228,7 +260,11 @@ impl SendHandler {
                 );
 
             tracing::trace!("Sending RequestSnapshot to receiver");
-            ev_handler.send(SenderToReceiver::RequestSnapshot).await?;
+            ev_handler
+                .send(SenderToReceiver::RequestSnapshot {
+                    subpath: self.subpath.clone(),
+                })
+                .await?;
 
             loop {
                 match ev_handler.recv().await? {
@@ -321,6 +357,25 @@ impl SendHandler {
     }
 }
 
+fn resolve_destination(root: &Path, subpath: &str) -> crate::Result<PathBuf> {
+    if subpath.starts_with(['/', '\\']) {
+        return Err(crate::Error::InvalidRelativePath(PathBuf::from(subpath)));
+    }
+
+    let mut destination = root.to_path_buf();
+    for component in subpath.split(['/', '\\']) {
+        if component.is_empty() {
+            continue;
+        }
+        if component == "." || component == ".." || component.contains(':') {
+            return Err(crate::Error::InvalidRelativePath(PathBuf::from(subpath)));
+        }
+        destination.push(component);
+    }
+
+    Ok(destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,14 +384,28 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_resolve_destination() {
+        let root = Path::new(r"C:\sync");
+        assert_eq!(
+            resolve_destination(root, r"subdir\").unwrap(),
+            root.join("subdir")
+        );
+        assert!(resolve_destination(root, r"..\outside").is_err());
+        assert!(resolve_destination(root, r"C:\outside").is_err());
+        assert!(resolve_destination(root, r"\outside").is_err());
+    }
+
     #[tokio::test]
     async fn test_end_to_end_sync_protocol() -> crate::Result<()> {
         let recv_dir = tempdir()?;
         let send_dir = tempdir()?;
+        let recv_subdir = recv_dir.path().join("nested");
+        std::fs::create_dir_all(&recv_subdir)?;
 
-        // Receiver state: a.txt ("old a"), b.txt ("will delete")
-        let recv_a = recv_dir.path().join("a.txt");
-        let recv_b = recv_dir.path().join("b.txt");
+        // Receiver state: nested/a.txt ("old a"), nested/b.txt ("will delete")
+        let recv_a = recv_subdir.join("a.txt");
+        let recv_b = recv_subdir.join("b.txt");
         std::fs::write(&recv_a, "old a content")?;
         std::fs::write(&recv_b, "to be deleted")?;
 
@@ -379,22 +448,27 @@ mod tests {
         let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
 
-        let send_handler =
-            SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        let send_handler = SendHandler::new(
+            send_stream,
+            recv_stream,
+            send_dir.path().to_path_buf(),
+            "nested".to_string(),
+        )
+        .await?;
         send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
 
         // Verify receiver files match sender state
         assert_eq!(
-            std::fs::read_to_string(recv_dir.path().join("a.txt"))?,
+            std::fs::read_to_string(recv_subdir.join("a.txt"))?,
             "new a content!"
         );
         assert_eq!(
-            std::fs::read_to_string(recv_dir.path().join("c.txt"))?,
+            std::fs::read_to_string(recv_subdir.join("c.txt"))?,
             "newly created c"
         );
-        assert!(!recv_dir.path().join("b.txt").exists());
+        assert!(!recv_subdir.join("b.txt").exists());
 
         // Verify events emitted
         let recv_recorded = recv_events.lock().unwrap();
@@ -457,8 +531,14 @@ mod tests {
         let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
 
-        let send_handler =
-            SendHandler::new(send_stream, recv_stream, send_dir.path().to_path_buf()).await?;
+        let send_handler = SendHandler::new(
+            send_stream,
+            recv_stream,
+            send_dir.path().to_path_buf(),
+            String::new(),
+        )
+        .await?;
+
         send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
@@ -479,6 +559,43 @@ mod tests {
                 .any(|e| matches!(e, SendEvent::Progress { .. }))
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_missing_destination_when_source_empty() -> crate::Result<()> {
+        let recv_dir = tempdir()?;
+        let send_dir = tempdir()?;
+        let destination = recv_dir.path().join("created/when/empty");
+
+        let recv_ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let send_ep = Endpoint::builder(presets::N0).bind().await?;
+        let recv_protocol = RecvProtocol::new(recv_dir.path().to_path_buf(), |_: RecvEvent| {});
+
+        let recv_ep_clone = recv_ep.clone();
+        let recv_handle = tokio::spawn(async move {
+            let incoming = recv_ep_clone.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_protocol.accept(conn).await.unwrap();
+        });
+
+        let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+        let send_handler = SendHandler::new(
+            send_stream,
+            recv_stream,
+            send_dir.path().to_path_buf(),
+            "created/when/empty".to_string(),
+        )
+        .await?;
+
+        send_handler.send_loop(|_: SendEvent| {}).await?;
+        recv_handle.await?;
+
+        assert!(destination.is_dir());
         Ok(())
     }
 }

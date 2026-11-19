@@ -24,6 +24,9 @@ pub struct Args {
 pub enum Command {
     Send {
         ticket: iroh_tickets::endpoint::EndpointTicket,
+        /// Relative directory to sync into on the receiver.
+        #[arg(long, default_value = "")]
+        subpath: String,
     },
     Receive,
 }
