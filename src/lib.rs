@@ -65,7 +65,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                     sink.clone(),
                 );
 
-            let mut destination: Option<Arc<Dir>> = None;
+            let mut destination: Option<(Arc<Dir>, PathBuf)> = None;
             loop {
                 let msg = match ev_handler.recv().await {
                     Ok(msg) => msg,
@@ -162,7 +162,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             }
                         };
 
-                        destination = Some(target_dir);
+                        destination = Some((target_dir, relative.clone()));
                         let old = match old_snapshot
                             .into_iter()
                             .map(|x| {
@@ -189,12 +189,15 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             break;
                         }
 
-                        sink.emit(RecvEvent::SnapshotSent { entry_count });
+                        sink.emit(RecvEvent::SnapshotSent {
+                            entry_count,
+                            subpath: relative,
+                        });
                     }
                     SenderToReceiver::SendPatch(items) => {
                         tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
-                        let Some(destination) = destination.as_ref() else {
+                        let Some((destination, subpath)) = destination.as_ref() else {
                             let err_msg =
                                 "Received patches before requesting a destination snapshot"
                                     .to_string();
@@ -204,7 +207,12 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             break;
                         };
 
-                        if !sink.emit_and_wait(RecvEvent::EntryPreApply).await {
+                        if !sink
+                            .emit_and_wait(RecvEvent::EntryPreApply {
+                                subpath: subpath.clone(),
+                            })
+                            .await
+                        {
                             let err_msg =
                                 "Pre-apply event handler did not complete successfully".to_string();
                             tracing::error!("{err_msg}");
@@ -218,7 +226,10 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             let path = item.path().to_path_buf();
                             tracing::debug!(path = %path.display(), "Receiving entry patch");
 
-                            sink.emit(RecvEvent::EntryReceiving { path: path.clone() });
+                            sink.emit(RecvEvent::EntryReceiving {
+                                path: path.clone(),
+                                subpath: subpath.clone(),
+                            });
 
                             if let Err(e) = item.apply_in(destination) {
                                 let err_msg =
@@ -231,14 +242,19 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             }
 
                             tracing::debug!(path = %path.display(), "Patch entry applied successfully");
-                            sink.emit(RecvEvent::EntryApplied { path });
+                            sink.emit(RecvEvent::EntryApplied {
+                                path,
+                                subpath: subpath.clone(),
+                            });
                         }
 
                         if apply_failed {
                             break;
                         }
 
-                        sink.emit(RecvEvent::EntryPostApply);
+                        sink.emit(RecvEvent::EntryPostApply {
+                            subpath: subpath.clone(),
+                        });
 
                         tracing::info!("All patches applied successfully, sending Ack");
                         if let Err(e) = ev_handler.send(ReceiverToSender::Ack).await {
@@ -550,12 +566,28 @@ mod tests {
         // Verify events emitted
         let recv_recorded = recv_events.lock().unwrap();
         let send_recorded = send_events.lock().unwrap();
+        let expected_subpath = PathBuf::from("nested");
 
         assert!(
             recv_recorded
                 .iter()
                 .any(|e| matches!(e, RecvEvent::Finished))
         );
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::SnapshotSent { subpath, .. } if subpath == &expected_subpath
+        )));
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryPreApply { subpath } if subpath == &expected_subpath
+        )));
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryReceiving { subpath, .. } if subpath == &expected_subpath
+        )));
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryApplied { subpath, .. } if subpath == &expected_subpath
+        )));
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryPostApply { subpath } if subpath == &expected_subpath
+        )));
         assert!(
             send_recorded
                 .iter()

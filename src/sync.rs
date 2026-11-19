@@ -42,12 +42,27 @@ pub enum SendEvent {
 #[derive(Clone, Debug)]
 pub enum RecvEvent {
     Started,
-    SnapshotSent { entry_count: usize },
-    EntryPreApply,
-    EntryReceiving { path: PathBuf },
-    Progress { bytes: usize },
-    EntryApplied { path: PathBuf },
-    EntryPostApply,
+    SnapshotSent {
+        entry_count: usize,
+        subpath: PathBuf,
+    },
+    EntryPreApply {
+        subpath: PathBuf,
+    },
+    EntryReceiving {
+        path: PathBuf,
+        subpath: PathBuf,
+    },
+    Progress {
+        bytes: usize,
+    },
+    EntryApplied {
+        path: PathBuf,
+        subpath: PathBuf,
+    },
+    EntryPostApply {
+        subpath: PathBuf,
+    },
     Finished,
     Error(String),
 }
