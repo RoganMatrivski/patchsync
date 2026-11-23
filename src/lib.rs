@@ -312,7 +312,24 @@ pub struct SendHandler {
     recv: iroh::endpoint::RecvStream,
     root: std::path::PathBuf,
     subpath: String,
-    meta: Metadata,
+    meta: MetaSource,
+}
+
+/// Callback that builds batch metadata from the computed diff.
+pub type MetadataFn = Box<dyn FnOnce(&[snapshot::SnapshotEntry]) -> Metadata + Send + 'static>;
+
+enum MetaSource {
+    Static(Metadata),
+    Fn(MetadataFn),
+}
+
+impl MetaSource {
+    fn resolve(self, entries: &[snapshot::SnapshotEntry]) -> Metadata {
+        match self {
+            Self::Static(meta) => meta,
+            Self::Fn(f) => f(entries),
+        }
+    }
 }
 
 impl SendHandler {
@@ -327,18 +344,32 @@ impl SendHandler {
             recv,
             root,
             subpath,
-            meta: Metadata::new(),
+            meta: MetaSource::Static(Metadata::new()),
         })
     }
 
     /// Attach metadata to the patch batch. The receiver sees it on every
     /// `RecvEvent::Entry*` event for that batch.
+    ///
+    /// Replaces any earlier [`with_metadata_fn`](Self::with_metadata_fn).
     pub fn with_metadata(mut self, meta: Metadata) -> Self {
-        self.meta = meta;
+        self.meta = MetaSource::Static(meta);
         self
     }
 
-    pub async fn send_loop(mut self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
+    /// Build the batch metadata from the computed diff, right before the
+    /// patch is sent. Not called when there are no changes to send.
+    ///
+    /// Replaces any earlier [`with_metadata`](Self::with_metadata).
+    pub fn with_metadata_fn(
+        mut self,
+        f: impl FnOnce(&[snapshot::SnapshotEntry]) -> Metadata + Send + 'static,
+    ) -> Self {
+        self.meta = MetaSource::Fn(Box::new(f));
+        self
+    }
+
+    pub async fn send_loop(self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
         let dispatcher = Dispatcher::spawn(handler);
         let sink = dispatcher.sink();
 
@@ -346,6 +377,7 @@ impl SendHandler {
 
         let result = async {
             tracing::info!(root = %self.root.display(), "Starting SendHandler sync loop");
+            let mut meta_source = Some(self.meta);
 
             let mut ev_handler =
                 EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
@@ -415,11 +447,16 @@ impl SendHandler {
                             total_bytes,
                         });
 
+                        let meta = meta_source
+                            .take()
+                            .map(|src| src.resolve(&diff))
+                            .unwrap_or_default();
+
                         tracing::debug!("Sending patch items to receiver");
                         ev_handler
                             .send(SenderToReceiver::SendPatch {
                                 entries: diff,
-                                meta: std::mem::take(&mut self.meta),
+                                meta,
                             })
                             .await?;
                     }
@@ -694,6 +731,61 @@ mod tests {
                 .any(|e| matches!(e, SendEvent::Progress { .. }))
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_fn_sees_diff() -> crate::Result<()> {
+        let recv_dir = tempdir()?;
+        let send_dir = tempdir()?;
+        std::fs::write(send_dir.path().join("one.txt"), "1")?;
+        std::fs::write(send_dir.path().join("two.txt"), "2")?;
+
+        let recv_ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let send_ep = Endpoint::builder(presets::N0).bind().await?;
+
+        let recv_events = Arc::new(Mutex::new(Vec::new()));
+        let recv_events_c = Arc::clone(&recv_events);
+        let recv_protocol =
+            RecvProtocol::new(recv_dir.path().to_path_buf(), move |e: RecvEvent| {
+                recv_events_c.lock().unwrap().push(e);
+            });
+
+        let recv_ep_clone = recv_ep.clone();
+        let recv_handle = tokio::spawn(async move {
+            let incoming = recv_ep_clone.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_protocol.accept(conn).await.unwrap();
+        });
+
+        let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+        let send_handler = SendHandler::new(
+            send_stream,
+            recv_stream,
+            send_dir.path().to_path_buf(),
+            String::new(),
+        )
+        .await?
+        .with_metadata(Metadata::from([("ignored".into(), Value::Null)]))
+        .with_metadata_fn(|entries| {
+            Metadata::from([("changed".into(), Value::from(entries.len() as u64))])
+        });
+
+        send_handler.send_loop(|_: SendEvent| {}).await?;
+        recv_handle.await?;
+
+        let expected = Metadata::from([("changed".into(), Value::from(2u64))]);
+        let recv_recorded = recv_events.lock().unwrap();
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryPreApply { meta, .. } if **meta == expected
+        )));
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::EntryPostApply { meta, .. } if **meta == expected
+        )));
         Ok(())
     }
 
