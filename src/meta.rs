@@ -104,12 +104,15 @@ impl Value {
 /// | `receiving`  | `EntryReceiving` (once per entry)       |
 /// | `applied`    | `EntryApplied` (once per entry)         |
 /// | `post_apply` | `EntryPostApply` (once per batch)       |
+/// | `up_to_date` | `UpToDate` (once, only with no changes) |
 ///
-/// All methods run on the sender after the diff is computed and before the
-/// patch is sent, in this order: `pre_apply`, then `receiving` and `applied`
-/// for each entry in diff order, then `post_apply`. They describe what the
-/// sender knows and can't reflect receiver-side outcomes. None of them are
-/// called when there are no changes to send.
+/// All methods run on the sender after the diff is computed and before
+/// anything is sent. They describe what the sender knows and can't reflect
+/// receiver-side outcomes.
+///
+/// - With changes: `pre_apply`, then `receiving` and `applied` for each
+///   entry in diff order, then `post_apply`. `up_to_date` is not called.
+/// - Without changes: only `up_to_date` is called.
 pub trait MetadataProvider: Send + 'static {
     fn pre_apply(&mut self, entries: &[SnapshotEntry]) -> Metadata {
         let _ = entries;
@@ -128,6 +131,10 @@ pub trait MetadataProvider: Send + 'static {
 
     fn post_apply(&mut self, entries: &[SnapshotEntry]) -> Metadata {
         let _ = entries;
+        Metadata::new()
+    }
+
+    fn up_to_date(&mut self) -> Metadata {
         Metadata::new()
     }
 }

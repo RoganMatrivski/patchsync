@@ -23,7 +23,7 @@ pub use error::{Error, Result};
 pub use event::EventHandler;
 pub use meta::{Metadata, MetadataProvider, Value};
 
-pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/3/";
+pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/4/";
 
 #[derive(Clone)]
 pub struct RecvProtocol {
@@ -289,8 +289,23 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         tracing::info!("RecvProtocol stream completed cleanly");
                         break;
                     }
-                    SenderToReceiver::Ack => {
-                        tracing::trace!("Received Ack from peer");
+                    SenderToReceiver::UpToDate { meta } => {
+                        tracing::trace!("Received UpToDate from sender");
+
+                        let Some((_, subpath)) = destination.as_ref() else {
+                            let err_msg =
+                                "Received UpToDate before requesting a destination snapshot"
+                                    .to_string();
+                            tracing::error!("{err_msg}");
+                            sink.emit(RecvEvent::Error(err_msg.clone()));
+                            let _ = ev_handler.send(ReceiverToSender::Error(err_msg)).await;
+                            break;
+                        };
+
+                        sink.emit(RecvEvent::UpToDate {
+                            subpath: subpath.clone(),
+                            meta,
+                        });
                         let _ = ev_handler.finish().await;
                         sink.emit(RecvEvent::Finished);
                         break;
@@ -397,8 +412,13 @@ impl SendHandler {
                                 total_bytes: 0,
                             });
 
-                            ev_handler.send(SenderToReceiver::Ack).await?;
+                            let meta = provider
+                                .as_mut()
+                                .map(|p| p.up_to_date())
+                                .unwrap_or_default();
+                            ev_handler.send(SenderToReceiver::UpToDate { meta }).await?;
                             ev_handler.finish().await?;
+                            sink.emit(SendEvent::UpToDate);
                             sink.emit(SendEvent::Finished);
                             break;
                         }
@@ -664,6 +684,16 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, SendEvent::Progress { .. }))
         );
+        assert!(
+            !recv_recorded
+                .iter()
+                .any(|e| matches!(e, RecvEvent::UpToDate { .. }))
+        );
+        assert!(
+            !send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::UpToDate))
+        );
 
         Ok(())
     }
@@ -682,7 +712,11 @@ mod tests {
             .await?;
         let send_ep = Endpoint::builder(presets::N0).bind().await?;
 
-        let recv_handler = |_: RecvEvent| {};
+        let recv_events = Arc::new(Mutex::new(Vec::new()));
+        let recv_events_c = Arc::clone(&recv_events);
+        let recv_handler = move |e: RecvEvent| {
+            recv_events_c.lock().unwrap().push(e);
+        };
         let send_events = Arc::new(Mutex::new(Vec::new()));
         let send_events_c = Arc::clone(&send_events);
         let send_handler_fn = move |e: SendEvent| {
@@ -728,6 +762,28 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, SendEvent::Progress { .. }))
         );
+        assert!(
+            send_recorded
+                .iter()
+                .any(|e| matches!(e, SendEvent::UpToDate))
+        );
+
+        let recv_recorded = recv_events.lock().unwrap();
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::UpToDate { subpath, meta } if subpath.as_os_str().is_empty() && meta.is_empty()
+        )));
+        assert!(
+            recv_recorded
+                .iter()
+                .any(|e| matches!(e, RecvEvent::Finished))
+        );
+        assert!(!recv_recorded.iter().any(|e| matches!(
+            e,
+            RecvEvent::EntryPreApply { .. }
+                | RecvEvent::EntryReceiving { .. }
+                | RecvEvent::EntryApplied { .. }
+                | RecvEvent::EntryPostApply { .. }
+        )));
 
         Ok(())
     }
@@ -838,6 +894,81 @@ mod tests {
             }
         }
         assert_eq!((pre, post, receiving, applied), (1, 1, 2, 2));
+        Ok(())
+    }
+
+    struct UpToDateProvider {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl MetadataProvider for UpToDateProvider {
+        fn pre_apply(&mut self, _entries: &[snapshot::SnapshotEntry]) -> Metadata {
+            self.calls.lock().unwrap().push("pre_apply");
+            Metadata::new()
+        }
+
+        fn post_apply(&mut self, _entries: &[snapshot::SnapshotEntry]) -> Metadata {
+            self.calls.lock().unwrap().push("post_apply");
+            Metadata::new()
+        }
+
+        fn up_to_date(&mut self) -> Metadata {
+            self.calls.lock().unwrap().push("up_to_date");
+            Metadata::from([("kind".into(), Value::from("up_to_date"))])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_up_to_date_metadata() -> crate::Result<()> {
+        let recv_dir = tempdir()?;
+        let send_dir = tempdir()?;
+        std::fs::write(recv_dir.path().join("same.txt"), "identical content")?;
+        std::fs::write(send_dir.path().join("same.txt"), "identical content")?;
+
+        let recv_ep = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let send_ep = Endpoint::builder(presets::N0).bind().await?;
+
+        let recv_events = Arc::new(Mutex::new(Vec::new()));
+        let recv_events_c = Arc::clone(&recv_events);
+        let recv_protocol =
+            RecvProtocol::new(recv_dir.path().to_path_buf(), move |e: RecvEvent| {
+                recv_events_c.lock().unwrap().push(e);
+            });
+
+        let recv_ep_clone = recv_ep.clone();
+        let recv_handle = tokio::spawn(async move {
+            let incoming = recv_ep_clone.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_protocol.accept(conn).await.unwrap();
+        });
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let conn = send_ep.connect(recv_ep.addr(), ALPN).await?;
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+        let send_handler = SendHandler::new(
+            send_stream,
+            recv_stream,
+            send_dir.path().to_path_buf(),
+            String::new(),
+        )
+        .await?
+        .with_metadata_provider(UpToDateProvider {
+            calls: Arc::clone(&calls),
+        });
+
+        send_handler.send_loop(|_: SendEvent| {}).await?;
+        recv_handle.await?;
+
+        assert_eq!(*calls.lock().unwrap(), vec!["up_to_date"]);
+
+        let expected = Metadata::from([("kind".into(), Value::from("up_to_date"))]);
+        let recv_recorded = recv_events.lock().unwrap();
+        assert!(recv_recorded.iter().any(|e| matches!(
+            e, RecvEvent::UpToDate { meta, .. } if *meta == expected
+        )));
         Ok(())
     }
 

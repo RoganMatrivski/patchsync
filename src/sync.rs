@@ -19,7 +19,10 @@ pub enum SenderToReceiver {
         pre_apply: Metadata,
         post_apply: Metadata,
     },
-    Ack,
+    /// Sent instead of `SendPatch` when there are no changes.
+    UpToDate {
+        meta: Metadata,
+    },
 }
 
 /// A single entry of a patch, with the metadata for its per-entry events.
@@ -50,6 +53,8 @@ pub enum SendEvent {
     Progress {
         bytes: usize,
     },
+    /// The receiver already matched the sender; no patch was sent.
+    UpToDate,
     Finished,
     Error(String),
 }
@@ -79,6 +84,11 @@ pub enum RecvEvent {
         meta: Metadata,
     },
     EntryPostApply {
+        subpath: PathBuf,
+        meta: Metadata,
+    },
+    /// The sender found no changes; no `Entry*` events fire for this sync.
+    UpToDate {
         subpath: PathBuf,
         meta: Metadata,
     },
