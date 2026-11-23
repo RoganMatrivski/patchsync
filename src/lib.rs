@@ -13,13 +13,15 @@ pub mod chunker;
 pub mod dirwalker;
 pub mod error;
 pub mod event;
+pub mod meta;
 pub mod snapshot;
 pub mod sync;
 
 pub use error::{Error, Result};
 pub use event::EventHandler;
+pub use meta::{Metadata, Value};
 
-pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/1/";
+pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/2/";
 
 #[derive(Clone)]
 pub struct RecvProtocol {
@@ -194,7 +196,8 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             subpath: relative,
                         });
                     }
-                    SenderToReceiver::SendPatch(items) => {
+                    SenderToReceiver::SendPatch { entries: items, meta } => {
+                        let meta = Arc::new(meta);
                         tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
                         let Some((destination, subpath)) = destination.as_ref() else {
@@ -210,6 +213,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         if !sink
                             .emit_and_wait(RecvEvent::EntryPreApply {
                                 subpath: subpath.clone(),
+                                meta: Arc::clone(&meta),
                             })
                             .await
                         {
@@ -229,6 +233,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             sink.emit(RecvEvent::EntryReceiving {
                                 path: path.clone(),
                                 subpath: subpath.clone(),
+                                meta: Arc::clone(&meta),
                             });
 
                             if let Err(e) = item.apply_in(destination) {
@@ -245,6 +250,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             sink.emit(RecvEvent::EntryApplied {
                                 path,
                                 subpath: subpath.clone(),
+                                meta: Arc::clone(&meta),
                             });
                         }
 
@@ -254,6 +260,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                         sink.emit(RecvEvent::EntryPostApply {
                             subpath: subpath.clone(),
+                            meta: Arc::clone(&meta),
                         });
 
                         tracing::info!("All patches applied successfully, sending Ack");
@@ -305,6 +312,7 @@ pub struct SendHandler {
     recv: iroh::endpoint::RecvStream,
     root: std::path::PathBuf,
     subpath: String,
+    meta: Metadata,
 }
 
 impl SendHandler {
@@ -319,10 +327,18 @@ impl SendHandler {
             recv,
             root,
             subpath,
+            meta: Metadata::new(),
         })
     }
 
-    pub async fn send_loop(self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
+    /// Attach metadata to the patch batch. The receiver sees it on every
+    /// `RecvEvent::Entry*` event for that batch.
+    pub fn with_metadata(mut self, meta: Metadata) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    pub async fn send_loop(mut self, handler: impl EventHandler<SendEvent>) -> crate::Result<()> {
         let dispatcher = Dispatcher::spawn(handler);
         let sink = dispatcher.sink();
 
@@ -400,7 +416,12 @@ impl SendHandler {
                         });
 
                         tracing::debug!("Sending patch items to receiver");
-                        ev_handler.send(SenderToReceiver::SendPatch(diff)).await?;
+                        ev_handler
+                            .send(SenderToReceiver::SendPatch {
+                                entries: diff,
+                                meta: std::mem::take(&mut self.meta),
+                            })
+                            .await?;
                     }
                     ReceiverToSender::Ack => {
                         tracing::info!("Received Ack from receiver, sync finished successfully");
@@ -508,6 +529,10 @@ mod tests {
         std::fs::write(&send_a, "new a content!")?;
         std::fs::write(&send_c, "newly created c")?;
 
+        let mut expected_meta = Metadata::new();
+        expected_meta.insert("source".into(), Value::from("test"));
+        expected_meta.insert("batch".into(), Value::from(7u64));
+
         // Bind endpoints
         let recv_ep = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN.to_vec()])
@@ -547,7 +572,8 @@ mod tests {
             send_dir.path().to_path_buf(),
             "nested".to_string(),
         )
-        .await?;
+        .await?
+        .with_metadata(expected_meta.clone());
         send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
@@ -577,16 +603,16 @@ mod tests {
             e, RecvEvent::SnapshotSent { subpath, .. } if subpath == &expected_subpath
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPreApply { subpath } if subpath == &expected_subpath
+            e, RecvEvent::EntryPreApply { subpath, meta } if subpath == &expected_subpath && **meta == expected_meta
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryReceiving { subpath, .. } if subpath == &expected_subpath
+            e, RecvEvent::EntryReceiving { subpath, meta, .. } if subpath == &expected_subpath && **meta == expected_meta
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryApplied { subpath, .. } if subpath == &expected_subpath
+            e, RecvEvent::EntryApplied { subpath, meta, .. } if subpath == &expected_subpath && **meta == expected_meta
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPostApply { subpath } if subpath == &expected_subpath
+            e, RecvEvent::EntryPostApply { subpath, meta } if subpath == &expected_subpath && **meta == expected_meta
         )));
         assert!(
             send_recorded

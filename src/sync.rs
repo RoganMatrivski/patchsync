@@ -1,17 +1,24 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     dirwalker::PathEntry,
     event::EventSink,
+    meta::Metadata,
     snapshot::{PathKey, SnapshotEntry},
 };
 
 #[derive(Serialize, Deserialize)]
 pub enum SenderToReceiver {
-    RequestSnapshot { subpath: String },
-    SendPatch(Vec<SnapshotEntry>),
+    RequestSnapshot {
+        subpath: String,
+    },
+    SendPatch {
+        entries: Vec<SnapshotEntry>,
+        meta: Metadata,
+    },
     Ack,
 }
 
@@ -48,10 +55,12 @@ pub enum RecvEvent {
     },
     EntryPreApply {
         subpath: PathBuf,
+        meta: Arc<Metadata>,
     },
     EntryReceiving {
         path: PathBuf,
         subpath: PathBuf,
+        meta: Arc<Metadata>,
     },
     Progress {
         bytes: usize,
@@ -59,9 +68,11 @@ pub enum RecvEvent {
     EntryApplied {
         path: PathBuf,
         subpath: PathBuf,
+        meta: Arc<Metadata>,
     },
     EntryPostApply {
         subpath: PathBuf,
+        meta: Arc<Metadata>,
     },
     Finished,
     Error(String),
