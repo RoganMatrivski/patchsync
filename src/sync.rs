@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -16,10 +15,19 @@ pub enum SenderToReceiver {
         subpath: String,
     },
     SendPatch {
-        entries: Vec<SnapshotEntry>,
-        meta: Metadata,
+        items: Vec<PatchItem>,
+        pre_apply: Metadata,
+        post_apply: Metadata,
     },
     Ack,
+}
+
+/// A single entry of a patch, with the metadata for its per-entry events.
+#[derive(Serialize, Deserialize)]
+pub struct PatchItem {
+    pub entry: SnapshotEntry,
+    pub receiving: Metadata,
+    pub applied: Metadata,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,12 +63,12 @@ pub enum RecvEvent {
     },
     EntryPreApply {
         subpath: PathBuf,
-        meta: Arc<Metadata>,
+        meta: Metadata,
     },
     EntryReceiving {
         path: PathBuf,
         subpath: PathBuf,
-        meta: Arc<Metadata>,
+        meta: Metadata,
     },
     Progress {
         bytes: usize,
@@ -68,11 +76,11 @@ pub enum RecvEvent {
     EntryApplied {
         path: PathBuf,
         subpath: PathBuf,
-        meta: Arc<Metadata>,
+        meta: Metadata,
     },
     EntryPostApply {
         subpath: PathBuf,
-        meta: Arc<Metadata>,
+        meta: Metadata,
     },
     Finished,
     Error(String),

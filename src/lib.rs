@@ -5,7 +5,9 @@ use std::sync::Arc;
 use crate::{
     event::Dispatcher,
     snapshot::PathKey,
-    sync::{EventStreamHandler, ReceiverToSender, RecvEvent, SendEvent, SenderToReceiver},
+    sync::{
+        EventStreamHandler, PatchItem, ReceiverToSender, RecvEvent, SendEvent, SenderToReceiver,
+    },
 };
 use cap_std::{ambient_authority, fs::Dir};
 
@@ -19,9 +21,9 @@ pub mod sync;
 
 pub use error::{Error, Result};
 pub use event::EventHandler;
-pub use meta::{Metadata, Value};
+pub use meta::{Metadata, MetadataProvider, Value};
 
-pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/2/";
+pub const ALPN: &[u8] = b"/id/my/rgmtrv/patchsync/3/";
 
 #[derive(Clone)]
 pub struct RecvProtocol {
@@ -196,8 +198,11 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             subpath: relative,
                         });
                     }
-                    SenderToReceiver::SendPatch { entries: items, meta } => {
-                        let meta = Arc::new(meta);
+                    SenderToReceiver::SendPatch {
+                        items,
+                        pre_apply,
+                        post_apply,
+                    } => {
                         tracing::info!(item_count = items.len(), "Receiving patches from sender");
 
                         let Some((destination, subpath)) = destination.as_ref() else {
@@ -213,7 +218,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         if !sink
                             .emit_and_wait(RecvEvent::EntryPreApply {
                                 subpath: subpath.clone(),
-                                meta: Arc::clone(&meta),
+                                meta: pre_apply,
                             })
                             .await
                         {
@@ -226,17 +231,22 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                         }
 
                         let mut apply_failed = false;
-                        for item in items {
-                            let path = item.path().to_path_buf();
+                        for PatchItem {
+                            entry,
+                            receiving,
+                            applied,
+                        } in items
+                        {
+                            let path = entry.path().to_path_buf();
                             tracing::debug!(path = %path.display(), "Receiving entry patch");
 
                             sink.emit(RecvEvent::EntryReceiving {
                                 path: path.clone(),
                                 subpath: subpath.clone(),
-                                meta: Arc::clone(&meta),
+                                meta: receiving,
                             });
 
-                            if let Err(e) = item.apply_in(destination) {
+                            if let Err(e) = entry.apply_in(destination) {
                                 let err_msg =
                                     format!("Failed to apply patch entry for {}: {e}", path.display());
                                 tracing::error!("{err_msg}");
@@ -250,7 +260,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
                             sink.emit(RecvEvent::EntryApplied {
                                 path,
                                 subpath: subpath.clone(),
-                                meta: Arc::clone(&meta),
+                                meta: applied,
                             });
                         }
 
@@ -260,7 +270,7 @@ impl iroh::protocol::ProtocolHandler for RecvProtocol {
 
                         sink.emit(RecvEvent::EntryPostApply {
                             subpath: subpath.clone(),
-                            meta: Arc::clone(&meta),
+                            meta: post_apply,
                         });
 
                         tracing::info!("All patches applied successfully, sending Ack");
@@ -312,24 +322,7 @@ pub struct SendHandler {
     recv: iroh::endpoint::RecvStream,
     root: std::path::PathBuf,
     subpath: String,
-    meta: MetaSource,
-}
-
-/// Callback that builds batch metadata from the computed diff.
-pub type MetadataFn = Box<dyn FnOnce(&[snapshot::SnapshotEntry]) -> Metadata + Send + 'static>;
-
-enum MetaSource {
-    Static(Metadata),
-    Fn(MetadataFn),
-}
-
-impl MetaSource {
-    fn resolve(self, entries: &[snapshot::SnapshotEntry]) -> Metadata {
-        match self {
-            Self::Static(meta) => meta,
-            Self::Fn(f) => f(entries),
-        }
-    }
+    meta: Option<Box<dyn MetadataProvider>>,
 }
 
 impl SendHandler {
@@ -344,28 +337,14 @@ impl SendHandler {
             recv,
             root,
             subpath,
-            meta: MetaSource::Static(Metadata::new()),
+            meta: None,
         })
     }
 
-    /// Attach metadata to the patch batch. The receiver sees it on every
-    /// `RecvEvent::Entry*` event for that batch.
-    ///
-    /// Replaces any earlier [`with_metadata_fn`](Self::with_metadata_fn).
-    pub fn with_metadata(mut self, meta: Metadata) -> Self {
-        self.meta = MetaSource::Static(meta);
-        self
-    }
-
-    /// Build the batch metadata from the computed diff, right before the
-    /// patch is sent. Not called when there are no changes to send.
-    ///
-    /// Replaces any earlier [`with_metadata`](Self::with_metadata).
-    pub fn with_metadata_fn(
-        mut self,
-        f: impl FnOnce(&[snapshot::SnapshotEntry]) -> Metadata + Send + 'static,
-    ) -> Self {
-        self.meta = MetaSource::Fn(Box::new(f));
+    /// Supply per-event metadata for the receiver's `RecvEvent::Entry*`
+    /// events. See [`MetadataProvider`] for when each method is called.
+    pub fn with_metadata_provider(mut self, provider: impl MetadataProvider) -> Self {
+        self.meta = Some(Box::new(provider));
         self
     }
 
@@ -377,7 +356,7 @@ impl SendHandler {
 
         let result = async {
             tracing::info!(root = %self.root.display(), "Starting SendHandler sync loop");
-            let mut meta_source = Some(self.meta);
+            let mut provider = self.meta;
 
             let mut ev_handler =
                 EventStreamHandler::<SenderToReceiver, ReceiverToSender, SendEvent>::new(
@@ -447,16 +426,40 @@ impl SendHandler {
                             total_bytes,
                         });
 
-                        let meta = meta_source
-                            .take()
-                            .map(|src| src.resolve(&diff))
-                            .unwrap_or_default();
+                        let (pre_apply, entry_meta, post_apply) = match provider.as_mut() {
+                            Some(p) => {
+                                let pre = p.pre_apply(&diff);
+                                let per_entry = diff
+                                    .iter()
+                                    .map(|e| (p.receiving(e), p.applied(e)))
+                                    .collect::<Vec<_>>();
+                                let post = p.post_apply(&diff);
+                                (pre, per_entry, post)
+                            }
+                            None => (
+                                Metadata::new(),
+                                std::iter::repeat_with(Default::default)
+                                    .take(diff.len())
+                                    .collect(),
+                                Metadata::new(),
+                            ),
+                        };
+                        let items = diff
+                            .into_iter()
+                            .zip(entry_meta)
+                            .map(|(entry, (receiving, applied))| PatchItem {
+                                entry,
+                                receiving,
+                                applied,
+                            })
+                            .collect();
 
                         tracing::debug!("Sending patch items to receiver");
                         ev_handler
                             .send(SenderToReceiver::SendPatch {
-                                entries: diff,
-                                meta,
+                                items,
+                                pre_apply,
+                                post_apply,
                             })
                             .await?;
                     }
@@ -566,10 +569,6 @@ mod tests {
         std::fs::write(&send_a, "new a content!")?;
         std::fs::write(&send_c, "newly created c")?;
 
-        let mut expected_meta = Metadata::new();
-        expected_meta.insert("source".into(), Value::from("test"));
-        expected_meta.insert("batch".into(), Value::from(7u64));
-
         // Bind endpoints
         let recv_ep = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN.to_vec()])
@@ -609,8 +608,7 @@ mod tests {
             send_dir.path().to_path_buf(),
             "nested".to_string(),
         )
-        .await?
-        .with_metadata(expected_meta.clone());
+        .await?;
         send_handler.send_loop(send_handler_fn).await?;
 
         recv_handle.await?;
@@ -640,16 +638,16 @@ mod tests {
             e, RecvEvent::SnapshotSent { subpath, .. } if subpath == &expected_subpath
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPreApply { subpath, meta } if subpath == &expected_subpath && **meta == expected_meta
+            e, RecvEvent::EntryPreApply { subpath, meta } if subpath == &expected_subpath && meta.is_empty()
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryReceiving { subpath, meta, .. } if subpath == &expected_subpath && **meta == expected_meta
+            e, RecvEvent::EntryReceiving { subpath, meta, .. } if subpath == &expected_subpath && meta.is_empty()
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryApplied { subpath, meta, .. } if subpath == &expected_subpath && **meta == expected_meta
+            e, RecvEvent::EntryApplied { subpath, meta, .. } if subpath == &expected_subpath && meta.is_empty()
         )));
         assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPostApply { subpath, meta } if subpath == &expected_subpath && **meta == expected_meta
+            e, RecvEvent::EntryPostApply { subpath, meta } if subpath == &expected_subpath && meta.is_empty()
         )));
         assert!(
             send_recorded
@@ -734,8 +732,43 @@ mod tests {
         Ok(())
     }
 
+    struct TestProvider;
+
+    impl MetadataProvider for TestProvider {
+        fn pre_apply(&mut self, entries: &[snapshot::SnapshotEntry]) -> Metadata {
+            Metadata::from([
+                ("kind".into(), Value::from("pre")),
+                ("count".into(), Value::from(entries.len() as u64)),
+            ])
+        }
+
+        fn receiving(&mut self, entry: &snapshot::SnapshotEntry) -> Metadata {
+            Metadata::from([
+                ("kind".into(), Value::from("recv")),
+                (
+                    "path".into(),
+                    Value::from(entry.path().to_string_lossy().into_owned()),
+                ),
+            ])
+        }
+
+        fn applied(&mut self, entry: &snapshot::SnapshotEntry) -> Metadata {
+            Metadata::from([
+                ("kind".into(), Value::from("applied")),
+                (
+                    "path".into(),
+                    Value::from(entry.path().to_string_lossy().into_owned()),
+                ),
+            ])
+        }
+
+        fn post_apply(&mut self, _entries: &[snapshot::SnapshotEntry]) -> Metadata {
+            Metadata::from([("kind".into(), Value::from("post"))])
+        }
+    }
+
     #[tokio::test]
-    async fn test_metadata_fn_sees_diff() -> crate::Result<()> {
+    async fn test_metadata_provider_per_event() -> crate::Result<()> {
         let recv_dir = tempdir()?;
         let send_dir = tempdir()?;
         std::fs::write(send_dir.path().join("one.txt"), "1")?;
@@ -770,22 +803,41 @@ mod tests {
             String::new(),
         )
         .await?
-        .with_metadata(Metadata::from([("ignored".into(), Value::Null)]))
-        .with_metadata_fn(|entries| {
-            Metadata::from([("changed".into(), Value::from(entries.len() as u64))])
-        });
+        .with_metadata_provider(TestProvider);
 
         send_handler.send_loop(|_: SendEvent| {}).await?;
         recv_handle.await?;
 
-        let expected = Metadata::from([("changed".into(), Value::from(2u64))]);
+        let kind = |m: &Metadata| m.get("kind").and_then(Value::as_str).map(str::to_owned);
+        let meta_path = |m: &Metadata| m.get("path").and_then(Value::as_str).map(str::to_owned);
+
         let recv_recorded = recv_events.lock().unwrap();
-        assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPreApply { meta, .. } if **meta == expected
-        )));
-        assert!(recv_recorded.iter().any(|e| matches!(
-            e, RecvEvent::EntryPostApply { meta, .. } if **meta == expected
-        )));
+        let (mut pre, mut post, mut receiving, mut applied) = (0, 0, 0, 0);
+        for e in recv_recorded.iter() {
+            match e {
+                RecvEvent::EntryPreApply { meta, .. } => {
+                    pre += 1;
+                    assert_eq!(kind(meta).as_deref(), Some("pre"));
+                    assert_eq!(meta.get("count").and_then(Value::as_u64), Some(2));
+                }
+                RecvEvent::EntryPostApply { meta, .. } => {
+                    post += 1;
+                    assert_eq!(kind(meta).as_deref(), Some("post"));
+                }
+                RecvEvent::EntryReceiving { path, meta, .. } => {
+                    receiving += 1;
+                    assert_eq!(kind(meta).as_deref(), Some("recv"));
+                    assert_eq!(meta_path(meta), Some(path.to_string_lossy().into_owned()));
+                }
+                RecvEvent::EntryApplied { path, meta, .. } => {
+                    applied += 1;
+                    assert_eq!(kind(meta).as_deref(), Some("applied"));
+                    assert_eq!(meta_path(meta), Some(path.to_string_lossy().into_owned()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((pre, post, receiving, applied), (1, 1, 2, 2));
         Ok(())
     }
 

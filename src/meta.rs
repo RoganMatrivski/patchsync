@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::snapshot::SnapshotEntry;
+
 /// String-keyed map of metadata values.
 pub type Metadata = BTreeMap<String, Value>;
 
@@ -88,6 +90,45 @@ impl Value {
             Self::Map(m) => Some(m),
             _ => None,
         }
+    }
+}
+
+/// Supplies per-event metadata on the sender side.
+///
+/// Every method defaults to an empty map, so only override what you need.
+/// The receiver gets each map on the matching `RecvEvent`:
+///
+/// | method       | event                                   |
+/// |--------------|-----------------------------------------|
+/// | `pre_apply`  | `EntryPreApply` (once per batch)        |
+/// | `receiving`  | `EntryReceiving` (once per entry)       |
+/// | `applied`    | `EntryApplied` (once per entry)         |
+/// | `post_apply` | `EntryPostApply` (once per batch)       |
+///
+/// All methods run on the sender after the diff is computed and before the
+/// patch is sent, in this order: `pre_apply`, then `receiving` and `applied`
+/// for each entry in diff order, then `post_apply`. They describe what the
+/// sender knows and can't reflect receiver-side outcomes. None of them are
+/// called when there are no changes to send.
+pub trait MetadataProvider: Send + 'static {
+    fn pre_apply(&mut self, entries: &[SnapshotEntry]) -> Metadata {
+        let _ = entries;
+        Metadata::new()
+    }
+
+    fn receiving(&mut self, entry: &SnapshotEntry) -> Metadata {
+        let _ = entry;
+        Metadata::new()
+    }
+
+    fn applied(&mut self, entry: &SnapshotEntry) -> Metadata {
+        let _ = entry;
+        Metadata::new()
+    }
+
+    fn post_apply(&mut self, entries: &[SnapshotEntry]) -> Metadata {
+        let _ = entries;
+        Metadata::new()
     }
 }
 
